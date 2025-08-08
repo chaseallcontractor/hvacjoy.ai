@@ -1,5 +1,11 @@
 // pages/api/chat.js
 export default async function handler(req, res) {
+  // ▶️ debug logging of env‐vars — you should see these in your Render logs
+  console.log("🔑 OPENAI_API_KEY:", process.env.OPENAI_API_KEY);
+  console.log("🔑 TWILIO_ACCOUNT_SID:", process.env.TWILIO_ACCOUNT_SID);
+  console.log("🔑 TWILIO_AUTH_TOKEN:", process.env.TWILIO_AUTH_TOKEN);
+  console.log("🔑 ELEVEN_LABS_API_KEY:", process.env.ELEVEN_LABS_API_KEY);
+
   // Only allow POST
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -11,14 +17,9 @@ export default async function handler(req, res) {
     return res.status(400).json({ error: 'Missing "speech" in request body' });
   }
 
-  // Read your service keys
+  // echo back, showing a truncated key for sanity
   const openaiKey = process.env.OPENAI_API_KEY;
-  const twilioSid = process.env.TWILIO_ACCOUNT_SID;
-  const twilioAuth = process.env.TWILIO_AUTH_TOKEN;
-  const elevenKey = process.env.ELEVEN_LABS_API_KEY;
-
-  // For now, just echo back
   return res.status(200).json({
-    reply: `You said: "${speech}". (OpenAI key is ${openaiKey?.slice(0, 4)}… for demo.)`
+    reply: `You said: "${speech}". (OpenAI key is ${openaiKey?.slice(0,4)}… for demo.)`
   });
 }
