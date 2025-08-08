@@ -1,5 +1,15 @@
 // pages/api/chat.js
 export default async function handler(req, res) {
+<<<<<<< HEAD
+=======
+  // ▶️ debug logging of env‐vars — you should see these in your Render logs
+  console.log("🔑 OPENAI_API_KEY:", process.env.OPENAI_API_KEY);
+  console.log("🔑 TWILIO_ACCOUNT_SID:", process.env.TWILIO_ACCOUNT_SID);
+  console.log("🔑 TWILIO_AUTH_TOKEN:", process.env.TWILIO_AUTH_TOKEN);
+  console.log("🔑 ELEVEN_LABS_API_KEY:", process.env.ELEVEN_LABS_API_KEY);
+
+  // Only allow POST
+>>>>>>> a7674845de0d251f3ad723ebfb966e7b63a47ed1
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
     return res.status(405).json({ error: 'Method Not Allowed' });
@@ -53,4 +63,13 @@ Answer FAQs, book appointments, or forward to a live agent if needed.
     console.error('chat handler error', err);
     return res.status(500).json({ error: 'Server error', detail: err?.message ?? String(err) });
   }
+<<<<<<< HEAD
+=======
+
+  // echo back, showing a truncated key for sanity
+  const openaiKey = process.env.OPENAI_API_KEY;
+  return res.status(200).json({
+    reply: `You said: "${speech}". (OpenAI key is ${openaiKey?.slice(0,4)}… for demo.)`
+  });
+>>>>>>> a7674845de0d251f3ad723ebfb966e7b63a47ed1
 }
