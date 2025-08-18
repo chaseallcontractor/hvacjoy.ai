@@ -1,23 +1,14 @@
 // pages/api/twilio-webhook.js
-// Twilio Voice webhook: Gather speech -> call /api/chat -> speak reply
+// Twilio Voice webhook: Gather speech -> call /api/chat -> Play ElevenLabs reply
 import querystring from 'querystring';
 
 export const config = {
-  api: { bodyParser: false }, // Disable Next.js default parser for raw Twilio form data
+  api: { bodyParser: false }, // we read Twilio's raw form body ourselves
 };
 
 function sendXml(res, twiml) {
   res.setHeader('Content-Type', 'text/xml');
   res.status(200).send(twiml);
-}
-
-function escapeXml(s) {
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&apos;');
 }
 
 function baseUrlFromReq(req) {
@@ -26,13 +17,18 @@ function baseUrlFromReq(req) {
   return `${proto}://${host}`;
 }
 
+function ttsUrl(req, text) {
+  const url = `${baseUrlFromReq(req)}/api/tts?text=${encodeURIComponent(text)}`;
+  return url;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // Manually read and parse Twilio's x-www-form-urlencoded body
+  // Parse Twilio x-www-form-urlencoded body
   let rawBody = '';
   await new Promise((resolve) => {
     req.on('data', (chunk) => (rawBody += chunk));
@@ -43,7 +39,7 @@ export default async function handler(req, res) {
   const from = body.From || 'Unknown';
   const speech = body.SpeechResult || '';
 
-  // If we have caller speech, send it to /api/chat
+  // If caller said something, get AI reply then Play it with ElevenLabs
   if (speech) {
     try {
       const resp = await fetch(`${baseUrlFromReq(req)}/api/chat`, {
@@ -58,30 +54,34 @@ export default async function handler(req, res) {
         if (data?.reply) reply = String(data.reply);
       }
 
+      const audioUrl = ttsUrl(req, reply);
+
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">${escapeXml(reply)}</Say>
+  <Play>${audioUrl}</Play>
   <Pause length="1"/>
   <Gather input="speech" action="/api/twilio-webhook" method="POST" speechTimeout="auto">
-    <Say voice="Polly.Joanna">Anything else I can help with?</Say>
+    <Play>${ttsUrl(req, 'Anything else I can help with?')}</Play>
   </Gather>
 </Response>`;
       return sendXml(res, twiml);
     } catch (err) {
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say>Sorry, I ran into a problem. I will connect you to a live agent.</Say>
+  <Play>${ttsUrl(req, 'Sorry, I ran into a problem. I will connect you to a live agent.')}</Play>
   <Hangup/>
 </Response>`;
       return sendXml(res, twiml);
     }
   }
 
-  // First turn: greet caller and start speech gather
+  // First turn: greet and start speech gather using ElevenLabs
+  const greeting = 'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna">Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.</Say>
-  <Gather input="speech" action="/api/twilio-webhook" method="POST" speechTimeout="auto"/>
+  <Gather input="speech" action="/api/twilio-webhook" method="POST" speechTimeout="auto">
+    <Play>${ttsUrl(req, greeting)}</Play>
+  </Gather>
 </Response>`;
   return sendXml(res, twiml);
 }
