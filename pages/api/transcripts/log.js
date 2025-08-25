@@ -1,5 +1,6 @@
 // pages/api/transcripts/log.js
-import { getSupabaseAdmin } from '../../../lib/supabase-admin';
+import { getSupabaseAdmin } from '@/lib/supabase-admin';
+
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
