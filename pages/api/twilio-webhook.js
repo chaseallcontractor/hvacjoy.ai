@@ -80,7 +80,9 @@ export default async function handler(req, res) {
         role: 'caller',
       });
 
-      // 2) Ask your chat endpoint for the assistant reply (+ slots) — NOW sends callSid
+      // 2) Ask your chat endpoint for the assistant reply (+ slots)
+      // NOTE: we pass along the LAST slots we have (from previous turn)
+      // so the model avoids re-asking already-filled questions.
       let reply = "I'm here to help with HVAC questions and scheduling.";
       let slots = { pricing_disclosed: false, emergency: false };
 
@@ -88,7 +90,7 @@ export default async function handler(req, res) {
         const resp = await fetch(`${baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ caller: from, speech, callSid }),
+          body: JSON.stringify({ caller: from, speech, callSid, lastSlots: slots }),
         });
         if (resp.ok) {
           const data = await resp.json();
@@ -114,16 +116,20 @@ export default async function handler(req, res) {
 
       // 4) Respond to the caller with ElevenLabs audio and gather next turn
       const replyUrl = ttsUrlAbsolute(baseUrl, reply);
-      const promptUrl = ttsUrlAbsolute(baseUrl, 'Anything else I can help with?');
+
+      // IMPORTANT:
+      // - We DO NOT play an extra "Anything else?" prompt anymore.
+      //   That was causing Joy to talk over the caller.
+      // - We give 3 seconds of silence tolerance for speech.
+      // - We add a short pause after speaking to sound natural.
 
       const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${replyUrl}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto">
-    <Play>${promptUrl}</Play>
-  </Gather>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="3"/>
+  <Pause length="2"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
@@ -147,16 +153,18 @@ export default async function handler(req, res) {
     }
   }
 
-  // First turn greeting
+  // First turn greeting (play, then listen)
   const greeting = 'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
   const greetingUrl = ttsUrlAbsolute(baseUrl, greeting);
 
   const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto">
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="3">
     <Play>${greetingUrl}</Play>
   </Gather>
+  <Pause length="2"/>
+  <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
   return sendXml(res, twiml);

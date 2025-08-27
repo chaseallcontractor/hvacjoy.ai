@@ -86,18 +86,17 @@ Return:
 }
 
 # Behavior
-- Use conversation context below to continue the flow. Do NOT repeat the greeting after it has already been said in this call.
+- Use the conversation context below. Do NOT repeat the greeting after it has been said.
+- Do NOT re-ask about a slot that is already filled (non-null) in the "known slots" section.
 - Fill slots progressively; unknowns stay null.
 - Never invent times or any prices beyond the two listed fees.
 - If emergency == true, prioritize the emergency script and escalation.
 `;
 
-/** Fetch ordered conversation turns for this call and map to ChatML */
 async function fetchHistoryMessages(callSid) {
   if (!callSid) return [];
   try {
     const supabase = getSupabaseAdmin();
-    // Limit to last ~20 turns for token economy
     const { data, error } = await supabase
       .from('call_transcripts')
       .select('role, text, turn_index')
@@ -107,7 +106,6 @@ async function fetchHistoryMessages(callSid) {
 
     if (error || !data) return [];
 
-    // Map DB roles to OpenAI roles
     return data.map((row) => ({
       role: row.role === 'assistant' ? 'assistant' : 'user',
       content: row.text || ''
@@ -125,31 +123,31 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { speech = "", caller = "", callSid = "" } = req.body || {};
+    const { speech = "", caller = "", callSid = "", lastSlots = {} } = req.body || {};
     if (!speech) return res.status(400).json({ error: 'Missing "speech" in body' });
 
     const apiKey = process.env.OPENAI_API_KEY;
     if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
 
-    // Build message list with prior turns
     const history = await fetchHistoryMessages(callSid);
 
     // Detect if greeting has already been delivered
     const greetingSaid = history.some(
       (m) => m.role === 'assistant' &&
-        m.content.includes('this call may be recorded') &&
-        m.content.includes('this is Joy')
+        m.content.toLowerCase().includes('this call may be recorded') &&
+        m.content.toLowerCase().includes('this is joy')
     );
 
-    // Steering hint to avoid repeating the greeting
-    const steering = greetingSaid
-      ? "Continue the call. Do not repeat the greeting. Ask the next relevant question to capture missing slots."
-      : "Start the call with the greeting, then proceed to capture caller details.";
+    // Steering hint + known slots context so we don't re-ask filled fields
+    const steering = (greetingSaid
+      ? "Continue the call. Do not repeat the greeting."
+      : "Start the call with the greeting, then proceed to capture caller details.") +
+      "\nKnown slots (do not re-ask if a field is non-null):\n" +
+      JSON.stringify(lastSlots || {}, null, 2);
 
     const messages = [
       { role: "system", content: SYSTEM_PROMPT },
       ...history,
-      // Nudge the assistant explicitly based on call state
       { role: "assistant", content: steering },
       { role: "user", content: speech }
     ];
@@ -163,7 +161,7 @@ export default async function handler(req, res) {
       body: JSON.stringify({
         model: "gpt-4o-mini",
         temperature: 0.3,
-        response_format: { type: "json_object" }, // force JSON
+        response_format: { type: "json_object" },
         messages,
       }),
     });
@@ -176,7 +174,6 @@ export default async function handler(req, res) {
     const data = await resp.json();
     const raw = data?.choices?.[0]?.message?.content ?? "{}";
 
-    // defensive parse + safe fallbacks so TTS never breaks
     let parsed;
     try {
       parsed = JSON.parse(raw);
@@ -196,7 +193,6 @@ export default async function handler(req, res) {
       parsed.slots = { pricing_disclosed: false, emergency: false };
     }
 
-    // Back-compat: you can keep reading 'reply' only if you want.
     return res.status(200).json({
       reply: parsed.reply,
       slots: parsed.slots,
