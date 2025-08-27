@@ -45,15 +45,6 @@ Primary goal: warmly book service, set expectations, and capture complete job de
    - Repeat name, address, number, units, window, fees, call-ahead, notes.
 8) Handoff: save notes; escalate emergencies or complex billing/warranty.
 
-# Edge scripts (use when relevant)
-- Ants/insects: "Thanks for letting me know—ants can interfere with controls. Please avoid spraying chemicals into the unit before the technician arrives. We'll inspect on site."
-- Icing: "Please switch the system off at the thermostat to let any ice melt before the visit."
-- Flexible-all-day: "Great—I'll note you're flexible. The technician will call before heading your way."
-- Not at home: "Do we have permission to access the outdoor unit? Any gate or pet notes?"
-- Warranty: "I'll note model/serial for the technician; warranty eligibility will be confirmed on site."
-- Reschedule: "I can move that for you. What new day works—morning or afternoon?"
-- Irate: "I understand why you're upset, and I want to help. I can capture the issue, outline today's visit charges, and get you the earliest appointment."
-
 # Output format (MUST be a single JSON object with these keys)
 Return:
 {
@@ -86,12 +77,18 @@ Return:
 }
 
 # Behavior
-- Use the conversation context below. Do NOT repeat the greeting after it has been said.
-- Do NOT re-ask about a slot that is already filled (non-null) in the "known slots" section.
+- Use conversation context below. Do NOT repeat the greeting after it has been said.
+- Do NOT re-ask about a slot that is already filled (non-null) in the "known slots".
 - Fill slots progressively; unknowns stay null.
 - Never invent times or any prices beyond the two listed fees.
-- If emergency == true, prioritize the emergency script and escalation.
+- If emergency == true, prioritize emergency script and escalate.
 `;
+
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
 
 async function fetchHistoryMessages(callSid) {
   if (!callSid) return [];
@@ -131,17 +128,17 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Detect if greeting has already been delivered
     const greetingSaid = history.some(
-      (m) => m.role === 'assistant' &&
+      (m) =>
+        m.role === 'assistant' &&
         m.content.toLowerCase().includes('this call may be recorded') &&
         m.content.toLowerCase().includes('this is joy')
     );
 
-    // Steering hint + known slots context so we don't re-ask filled fields
-    const steering = (greetingSaid
-      ? "Continue the call. Do not repeat the greeting."
-      : "Start the call with the greeting, then proceed to capture caller details.") +
+    const steering =
+      (greetingSaid
+        ? "Continue the call. Do not repeat the greeting."
+        : "Start the call with the greeting, then proceed to capture caller details.") +
       "\nKnown slots (do not re-ask if a field is non-null):\n" +
       JSON.stringify(lastSlots || {}, null, 2);
 
@@ -151,6 +148,9 @@ export default async function handler(req, res) {
       { role: "assistant", content: steering },
       { role: "user", content: speech }
     ];
+
+    const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
+    const t = withTimeout(OPENAI_TIMEOUT_MS);
 
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
@@ -164,11 +164,20 @@ export default async function handler(req, res) {
         response_format: { type: "json_object" },
         messages,
       }),
-    });
+      signal: t.signal,
+    }).catch(e => { throw e; })
+      .finally(() => t.cancel());
 
-    if (!resp.ok) {
-      const text = await resp.text();
-      return res.status(502).json({ error: "OpenAI error", detail: text });
+    if (!resp?.ok) {
+      const text = await resp?.text();
+      console.error("OpenAI error", text);
+      return res.status(200).json({
+        reply:
+          "Thanks for that. Please give me a moment, and continue with the next detail—your street address, city, and zip.",
+        slots: lastSlots || {},
+        model: "gpt-4o-mini",
+        usage: null,
+      });
     }
 
     const data = await resp.json();
@@ -180,17 +189,17 @@ export default async function handler(req, res) {
     } catch {
       parsed = {
         reply:
-          "Sorry, I had trouble just now. Could you repeat that so I can help you book?",
-        slots: { pricing_disclosed: false, emergency: false },
+          "Thanks. I’m ready for the next detail. What is the street address, city, and zip?",
+        slots: lastSlots || {},
       };
     }
 
     if (typeof parsed.reply !== "string") {
       parsed.reply =
-        "Thanks for calling. How can I help you with heating or cooling today?";
+        "Thanks. What’s the next detail—street address, city, and zip?";
     }
     if (!parsed.slots || typeof parsed.slots !== "object") {
-      parsed.slots = { pricing_disclosed: false, emergency: false };
+      parsed.slots = lastSlots || {};
     }
 
     return res.status(200).json({
@@ -201,10 +210,10 @@ export default async function handler(req, res) {
     });
   } catch (err) {
     console.error("chat handler error", err);
-    return res.status(500).json({
+    return res.status(200).json({
       reply:
-        "I'm having trouble right now. May I have a teammate call you right back?",
-      slots: { emergency: false },
+        "I caught that. Please share the street address, city, and zip when you’re ready.",
+      slots: {}, // keep moving; slots will fill on the next turn
       error: "Server error",
       detail: err?.message ?? String(err),
     });

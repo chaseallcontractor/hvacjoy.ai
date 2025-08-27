@@ -44,6 +44,12 @@ async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (error) console.error('Supabase insert failed:', error.message);
 }
 
+function withTimeout(ms) {
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), ms);
+  return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -62,7 +68,7 @@ export default async function handler(req, res) {
   const callSid = body.CallSid || null;
   const speech = body.SpeechResult || '';
 
-  // Precompute absolute URLs to avoid nested ${ ... } inside backticks
+  // Precompute absolute URLs
   const baseUrl = baseUrlFromReq(req);
   const actionUrl = `${baseUrl}/api/twilio-webhook`;
 
@@ -81,27 +87,47 @@ export default async function handler(req, res) {
       });
 
       // 2) Ask your chat endpoint for the assistant reply (+ slots)
-      // NOTE: we pass along the LAST slots we have (from previous turn)
+      // We'll pass the *last known* slots from the most recent assistant turn
       // so the model avoids re-asking already-filled questions.
-      let reply = "I'm here to help with HVAC questions and scheduling.";
+      let reply = "Thanks — one moment.";
       let slots = { pricing_disclosed: false, emergency: false };
 
       try {
+        // read last assistant meta.slots if available
+        const { data: lastTurns } = await supabase
+          .from('call_transcripts')
+          .select('role, meta, turn_index')
+          .eq('call_sid', callSid)
+          .order('turn_index', { ascending: false })
+          .limit(3);
+
+        const lastAssistant = (lastTurns || []).find(t => t.role === 'assistant');
+        const lastSlots = lastAssistant?.meta?.slots || {};
+
+        // timeout wrapper for /api/chat call
+        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '12000', 10);
+        const t = withTimeout(CHAT_TIMEOUT_MS);
+
         const resp = await fetch(`${baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ caller: from, speech, callSid, lastSlots: slots }),
-        });
-        if (resp.ok) {
+          body: JSON.stringify({ caller: from, speech, callSid, lastSlots }),
+          signal: t.signal,
+        }).catch(e => { throw e; })
+          .finally(() => t.cancel());
+
+        if (resp?.ok) {
           const data = await resp.json();
           if (data?.reply) reply = String(data.reply);
           if (data && typeof data.slots === 'object') slots = data.slots;
         } else {
-          const text = await resp.text();
+          const text = await resp?.text();
           console.error('Chat API error:', text);
+          reply = "Thanks. I caught that. One moment while I get the next step.";
         }
       } catch (e) {
         console.error('Chat API error:', e);
+        reply = "Thanks. I heard you. Give me just a moment.";
       }
 
       // 3) Log assistant turn WITH meta.slots
@@ -116,12 +142,6 @@ export default async function handler(req, res) {
 
       // 4) Respond to the caller with ElevenLabs audio and gather next turn
       const replyUrl = ttsUrlAbsolute(baseUrl, reply);
-
-      // IMPORTANT:
-      // - We DO NOT play an extra "Anything else?" prompt anymore.
-      //   That was causing Joy to talk over the caller.
-      // - We give 3 seconds of silence tolerance for speech.
-      // - We add a short pause after speaking to sound natural.
 
       const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
