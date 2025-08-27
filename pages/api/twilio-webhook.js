@@ -15,14 +15,17 @@ function sendXml(res, twiml) {
 }
 
 function baseUrlFromReq(req) {
+  // Prefer forwarded headers from Cloudflare/Render; default to https
   const protoHeader = req.headers['x-forwarded-proto'] || '';
   const proto = protoHeader.split(',')[0]?.trim() || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${proto}://${host}`;
 }
 
-function ttsUrl(req, text) {
-  return `${baseUrlFromReq(req)}/api/tts?text=${encodeURIComponent(text)}`;
+function ttsUrlAbsolute(baseUrl, text, voice) {
+  const params = new URLSearchParams({ text });
+  if (voice) params.set('voice', voice);
+  return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
 // small helper so we don't duplicate insert code
@@ -59,6 +62,10 @@ export default async function handler(req, res) {
   const callSid = body.CallSid || null;
   const speech = body.SpeechResult || '';
 
+  // Precompute absolute URLs to avoid nested ${ ... } inside backticks
+  const baseUrl = baseUrlFromReq(req);
+  const actionUrl = `${baseUrl}/api/twilio-webhook`;
+
   // If caller spoke, log it, get the AI reply, log it, and respond with TTS
   if (speech) {
     try {
@@ -78,7 +85,7 @@ export default async function handler(req, res) {
       let slots = { pricing_disclosed: false, emergency: false };
 
       try {
-        const resp = await fetch(`${baseUrlFromReq(req)}/api/chat`, {
+        const resp = await fetch(`${baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify({ caller: from, speech }),
@@ -106,34 +113,51 @@ export default async function handler(req, res) {
       });
 
       // 4) Respond to the caller with ElevenLabs audio and gather next turn
-      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+      const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+      const promptUrl = ttsUrlAbsolute(baseUrl, 'Anything else I can help with?');
+
+      const twiml =
+`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${ttsUrl(req, reply)}</Play>
+  <Play>${replyUrl}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="${baseUrlFromReq(req)}/api/twilio-webhook" method="POST" speechTimeout="auto">
-    <Play>${ttsUrl(req, 'Anything else I can help with?')}</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto">
+    <Play>${promptUrl}</Play>
   </Gather>
-  <Redirect method="POST">${baseUrlFromReq(req)}/api/twilio-webhook</Redirect>
+  <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
+
       return sendXml(res, twiml);
     } catch (err) {
       console.error('Webhook error:', err);
-      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+
+      const fallbackUrl = ttsUrlAbsolute(
+        baseUrl,
+        'Sorry, I ran into a problem. I will connect you to a live agent.'
+      );
+
+      const twiml =
+`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Play>${ttsUrl(req, 'Sorry, I ran into a problem. I will connect you to a live agent.')}</Play>
+  <Play>${fallbackUrl}</Play>
   <Hangup/>
 </Response>`;
+
       return sendXml(res, twiml);
     }
   }
 
   // First turn greeting
-  const greeting =
-    'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
-  const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  const greeting = 'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
+  const greetingUrl = ttsUrlAbsolute(baseUrl, greeting);
+
+  const twiml =
+`<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${baseUrlFromReq(req)}/api/twilio-webhook" method="POST" speechTimeout="auto">
-    <Play>${ttsUrl(req, greeting)}</Play>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto">
+    <Play>${greetingUrl}</Play>
   </Gather>
 </Response>`;
+
   return sendXml(res, twiml);
+}
