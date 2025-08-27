@@ -43,45 +43,50 @@ Primary goal: warmly book service, set expectations, and capture complete job de
    - "Are you on our maintenance program?" Brief offer if not.
 7) Confirm & summarize:
    - Repeat name, address, number, units, window, fees, call-ahead, notes.
-8) Handoff: save notes; escalate emergencies or complex billing/warranty.
+8) Close & goodbye:
+   - After details above are confirmed and pricing disclosed, politely end the call.
+   - Example: "You’re set for <date/window>. We’ll call ahead. Thank you for choosing us. Goodbye."
 
-# Output format (MUST be a single JSON object with these keys)
+# Output format (MUST be one JSON object)
 Return:
 {
-  "reply": "<what Joy should say, voice-ready, short sentences>",
-  "slots": {
-    "full_name": null | "<string>",
-    "callback_number": null | "<string>",
-    "service_address": {
-      "line1": null | "<string>",
-      "line2": null | "<string>",
-      "city": null | "<string>",
-      "state": null | "<string>",
-      "zip": null | "<string>",
-      "gate_or_entry_notes": null | "<string>",
-      "parking_notes": null | "<string>"
-    },
-    "unit_count": null | <number>,
-    "unit_locations": null | "<string>",
-    "brand": null | "<string>",
-    "symptoms": [],
-    "thermostat": { "setpoint": null | "<string|number>", "current": null | "<string|number>" },
-    "membership_status": null | "member" | "non_member" | "unknown",
-    "preferred_date": null | "<ISO or natural language>",
-    "preferred_window": null | "morning" | "afternoon" | "flexible_all_day" | "<time window>",
-    "call_ahead": null | true | false,
-    "hazards_pets_ants_notes": null | "<string>",
-    "pricing_disclosed": true | false,
-    "emergency": false | true
-  }
+  "reply": "<Joy's next line (voice-ready, short sentences)>",
+  "slots": { ... as defined below ... },
+  "done": false | true,              // true when booking confirmed & nothing else needed
+  "goodbye": null | "<string>"       // polite sign-off to play before hangup when done=true
+}
+
+slots schema:
+{
+  "full_name": null | "<string>",
+  "callback_number": null | "<string>",
+  "service_address": {
+    "line1": null | "<string>",
+    "line2": null | "<string>",
+    "city": null | "<string>",
+    "state": null | "<string>",
+    "zip": null | "<string>",
+    "gate_or_entry_notes": null | "<string>",
+    "parking_notes": null | "<string>"
+  },
+  "unit_count": null | <number>,
+  "unit_locations": null | "<string>",
+  "brand": null | "<string>",
+  "symptoms": [],
+  "thermostat": { "setpoint": null | "<string|number>", "current": null | "<string|number>" },
+  "membership_status": null | "member" | "non_member" | "unknown",
+  "preferred_date": null | "<ISO or natural language>",
+  "preferred_window": null | "morning" | "afternoon" | "flexible_all_day" | "<time window>",
+  "call_ahead": null | true | false,
+  "hazards_pets_ants_notes": null | "<string>",
+  "pricing_disclosed": true | false,
+  "emergency": false | true
 }
 
 # Behavior
 - Use conversation context below. Do NOT repeat the greeting after it has been said.
-- Do NOT re-ask about a slot that is already filled (non-null) in the "known slots".
-- Fill slots progressively; unknowns stay null.
-- Never invent times or any prices beyond the two listed fees.
-- If emergency == true, prioritize emergency script and escalate.
+- Do NOT re-ask questions for slots that are already non-null in the "known slots".
+- Mark done=true only after: name, address line1/city/state/zip, callback_number, pricing_disclosed=true, and either preferred_date or preferred_window are set. Provide a warm goodbye line.
 `;
 
 function withTimeout(ms) {
@@ -175,6 +180,8 @@ export default async function handler(req, res) {
         reply:
           "Thanks for that. Please give me a moment, and continue with the next detail—your street address, city, and zip.",
         slots: lastSlots || {},
+        done: false,
+        goodbye: null,
         model: "gpt-4o-mini",
         usage: null,
       });
@@ -191,6 +198,8 @@ export default async function handler(req, res) {
         reply:
           "Thanks. I’m ready for the next detail. What is the street address, city, and zip?",
         slots: lastSlots || {},
+        done: false,
+        goodbye: null,
       };
     }
 
@@ -201,10 +210,16 @@ export default async function handler(req, res) {
     if (!parsed.slots || typeof parsed.slots !== "object") {
       parsed.slots = lastSlots || {};
     }
+    if (typeof parsed.done !== "boolean") parsed.done = false;
+    if (parsed.done && typeof parsed.goodbye !== "string") {
+      parsed.goodbye = "Thank you for choosing HVAC Joy. We’ll see you then. Goodbye.";
+    }
 
     return res.status(200).json({
       reply: parsed.reply,
       slots: parsed.slots,
+      done: parsed.done,
+      goodbye: parsed.goodbye || null,
       model: "gpt-4o-mini",
       usage: data?.usage ?? null,
     });
@@ -213,7 +228,9 @@ export default async function handler(req, res) {
     return res.status(200).json({
       reply:
         "I caught that. Please share the street address, city, and zip when you’re ready.",
-      slots: {}, // keep moving; slots will fill on the next turn
+      slots: {},
+      done: false,
+      goodbye: null,
       error: "Server error",
       detail: err?.message ?? String(err),
     });

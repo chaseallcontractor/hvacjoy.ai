@@ -86,14 +86,14 @@ export default async function handler(req, res) {
         role: 'caller',
       });
 
-      // 2) Ask your chat endpoint for the assistant reply (+ slots)
-      // We'll pass the *last known* slots from the most recent assistant turn
-      // so the model avoids re-asking already-filled questions.
+      // 2) Ask your chat endpoint for the assistant reply (+ slots + done)
       let reply = "Thanks — one moment.";
       let slots = { pricing_disclosed: false, emergency: false };
+      let done = false;
+      let goodbye = null;
 
       try {
-        // read last assistant meta.slots if available
+        // read last assistant meta.slots if available (helps avoid re-asking)
         const { data: lastTurns } = await supabase
           .from('call_transcripts')
           .select('role, meta, turn_index')
@@ -120,6 +120,8 @@ export default async function handler(req, res) {
           const data = await resp.json();
           if (data?.reply) reply = String(data.reply);
           if (data && typeof data.slots === 'object') slots = data.slots;
+          if (typeof data?.done === 'boolean') done = data.done;
+          if (typeof data?.goodbye === 'string') goodbye = data.goodbye;
         } else {
           const text = await resp?.text();
           console.error('Chat API error:', text);
@@ -137,10 +139,30 @@ export default async function handler(req, res) {
         callSid,
         text: reply,
         role: 'assistant',
-        meta: { slots },
+        meta: { slots, done, goodbye },
       });
 
-      // 4) Respond to the caller with ElevenLabs audio and gather next turn
+      // 4) Build TwiML depending on whether we're finished
+      if (done) {
+        const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+        const byeText =
+          goodbye ||
+          "Thank you. You’re all set. We look forward to helping you. Goodbye.";
+        const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
+
+        const twiml =
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${replyUrl}</Play>
+  <Pause length="1"/>
+  <Play>${byeUrl}</Play>
+  <Hangup/>
+</Response>`;
+
+        return sendXml(res, twiml);
+      }
+
+      // Otherwise, continue the loop (longer listen + pacing)
       const replyUrl = ttsUrlAbsolute(baseUrl, reply);
 
       const twiml =
