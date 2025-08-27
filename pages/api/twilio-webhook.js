@@ -15,8 +15,9 @@ function sendXml(res, twiml) {
 }
 
 function baseUrlFromReq(req) {
-  const proto = req.headers['x-forwarded-proto'] || 'http';
-  const host = req.headers.host;
+  const protoHeader = req.headers['x-forwarded-proto'] || '';
+  const proto = protoHeader.split(',')[0]?.trim() || 'https';
+  const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${proto}://${host}`;
 }
 
@@ -25,17 +26,16 @@ function ttsUrl(req, text) {
 }
 
 // small helper so we don't duplicate insert code
-async function logTurn({ supabase, caller, callSid, text, role }) {
+async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (!text) return;
   const { error } = await supabase.from('call_transcripts').insert([
     {
       caller_phone: caller || null,
-      text: String(text).slice(0, 5000), // safety
-      role,                               // 'caller' | 'assistant'
+      text: String(text).slice(0, 5000),
+      role, // 'caller' | 'assistant'
       call_sid: callSid || null,
-      // quick ordering; you can switch to a proper counter later if you want
-      turn_index: Date.now(),
-      meta: {},
+      turn_index: Date.now(), // bigint-friendly
+      meta,
     },
   ]);
   if (error) console.error('Supabase insert failed:', error.message);
@@ -73,8 +73,10 @@ export default async function handler(req, res) {
         role: 'caller',
       });
 
-      // 2) Ask your chat endpoint for the assistant reply
+      // 2) Ask your chat endpoint for the assistant reply (+ slots)
       let reply = "I'm here to help with HVAC questions and scheduling.";
+      let slots = { pricing_disclosed: false, emergency: false };
+
       try {
         const resp = await fetch(`${baseUrlFromReq(req)}/api/chat`, {
           method: 'POST',
@@ -84,28 +86,34 @@ export default async function handler(req, res) {
         if (resp.ok) {
           const data = await resp.json();
           if (data?.reply) reply = String(data.reply);
+          if (data && typeof data.slots === 'object') slots = data.slots;
+        } else {
+          const text = await resp.text();
+          console.error('Chat API error:', text);
         }
       } catch (e) {
         console.error('Chat API error:', e);
       }
 
-      // 3) Log assistant turn
+      // 3) Log assistant turn WITH meta.slots
       await logTurn({
         supabase,
         caller: from,
         callSid,
         text: reply,
         role: 'assistant',
+        meta: { slots },
       });
 
-      // 4) Respond to the caller with ElevenLabs audio
+      // 4) Respond to the caller with ElevenLabs audio and gather next turn
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${ttsUrl(req, reply)}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="/api/twilio-webhook" method="POST" speechTimeout="auto">
+  <Gather input="speech" action="${baseUrlFromReq(req)}/api/twilio-webhook" method="POST" speechTimeout="auto">
     <Play>${ttsUrl(req, 'Anything else I can help with?')}</Play>
   </Gather>
+  <Redirect method="POST">${baseUrlFromReq(req)}/api/twilio-webhook</Redirect>
 </Response>`;
       return sendXml(res, twiml);
     } catch (err) {
@@ -124,9 +132,8 @@ export default async function handler(req, res) {
     'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
   const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="/api/twilio-webhook" method="POST" speechTimeout="auto">
+  <Gather input="speech" action="${baseUrlFromReq(req)}/api/twilio-webhook" method="POST" speechTimeout="auto">
     <Play>${ttsUrl(req, greeting)}</Play>
   </Gather>
 </Response>`;
   return sendXml(res, twiml);
-}
