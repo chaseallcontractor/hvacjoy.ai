@@ -1,21 +1,8 @@
 /* eslint-disable */
 // pages/api/chat.js
+import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
-export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
-    return res.status(405).json({ error: "Method Not Allowed" });
-  }
-
-  try {
-    const { speech = "", caller = "" } = req.body || {};
-    if (!speech) return res.status(400).json({ error: 'Missing "speech" in body' });
-
-    const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
-
-    // === new system prompt (voice-optimized, guardrails, slot schema) ===
-    const SYSTEM_PROMPT = `
+const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential HVAC company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
@@ -99,12 +86,74 @@ Return:
 }
 
 # Behavior
+- Use conversation context below to continue the flow. Do NOT repeat the greeting after it has already been said in this call.
 - Fill slots progressively; unknowns stay null.
 - Never invent times or any prices beyond the two listed fees.
 - If emergency == true, prioritize the emergency script and escalation.
-`.trim();
+`;
 
-    // === call OpenAI with JSON mode ===
+/** Fetch ordered conversation turns for this call and map to ChatML */
+async function fetchHistoryMessages(callSid) {
+  if (!callSid) return [];
+  try {
+    const supabase = getSupabaseAdmin();
+    // Limit to last ~20 turns for token economy
+    const { data, error } = await supabase
+      .from('call_transcripts')
+      .select('role, text, turn_index')
+      .eq('call_sid', callSid)
+      .order('turn_index', { ascending: true })
+      .limit(20);
+
+    if (error || !data) return [];
+
+    // Map DB roles to OpenAI roles
+    return data.map((row) => ({
+      role: row.role === 'assistant' ? 'assistant' : 'user',
+      content: row.text || ''
+    }));
+  } catch (e) {
+    console.error('fetchHistoryMessages error', e);
+    return [];
+  }
+}
+
+export default async function handler(req, res) {
+  if (req.method !== "POST") {
+    res.setHeader("Allow", ["POST"]);
+    return res.status(405).json({ error: "Method Not Allowed" });
+  }
+
+  try {
+    const { speech = "", caller = "", callSid = "" } = req.body || {};
+    if (!speech) return res.status(400).json({ error: 'Missing "speech" in body' });
+
+    const apiKey = process.env.OPENAI_API_KEY;
+    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+
+    // Build message list with prior turns
+    const history = await fetchHistoryMessages(callSid);
+
+    // Detect if greeting has already been delivered
+    const greetingSaid = history.some(
+      (m) => m.role === 'assistant' &&
+        m.content.includes('this call may be recorded') &&
+        m.content.includes('this is Joy')
+    );
+
+    // Steering hint to avoid repeating the greeting
+    const steering = greetingSaid
+      ? "Continue the call. Do not repeat the greeting. Ask the next relevant question to capture missing slots."
+      : "Start the call with the greeting, then proceed to capture caller details.";
+
+    const messages = [
+      { role: "system", content: SYSTEM_PROMPT },
+      ...history,
+      // Nudge the assistant explicitly based on call state
+      { role: "assistant", content: steering },
+      { role: "user", content: speech }
+    ];
+
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
       method: "POST",
       headers: {
@@ -115,16 +164,7 @@ Return:
         model: "gpt-4o-mini",
         temperature: 0.3,
         response_format: { type: "json_object" }, // force JSON
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          {
-            role: "user",
-            content:
-              `Caller: ${caller || "Unknown"}\n` +
-              `Speech: ${speech}\n\n` +
-              `Return JSON with { reply, slots } exactly as specified.`,
-          },
-        ],
+        messages,
       }),
     });
 

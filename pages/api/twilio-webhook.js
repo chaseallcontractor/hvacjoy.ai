@@ -80,7 +80,7 @@ export default async function handler(req, res) {
         role: 'caller',
       });
 
-      // 2) Ask your chat endpoint for the assistant reply (+ slots)
+      // 2) Ask your chat endpoint for the assistant reply (+ slots) — NOW sends callSid
       let reply = "I'm here to help with HVAC questions and scheduling.";
       let slots = { pricing_disclosed: false, emergency: false };
 
@@ -88,7 +88,7 @@ export default async function handler(req, res) {
         const resp = await fetch(`${baseUrl}/api/chat`, {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({ caller: from, speech }),
+          body: JSON.stringify({ caller: from, speech, callSid }),
         });
         if (resp.ok) {
           const data = await resp.json();
