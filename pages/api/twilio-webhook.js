@@ -36,6 +36,29 @@ function normalizeForTTS(s) {
     .replace(/\bHvac\b/g, 'H.V.A.C.');
 }
 
+// Simple detector for “problem” statements; triggers empathy injection.
+const SYMPTOM_HINTS = [
+  /no (cool|cooling|heat|heating)/i,
+  /(blowing|blows) (hot|warm|cold)/i,
+  /(not|won[’']?t) (work|turn on|start|run)/i,
+  /broke|broken|down|leak|leaking|ice|icing|iced|smell|odor/i,
+  /loud|noise|noisy|buzz|grind|rattle|bang/i,
+  /thermostat.*(not|won[’']?t)/i,
+  /error|fault|alarm|code/i,
+];
+
+function looksLikeAProblem(speech) {
+  if (!speech) return false;
+  return SYMPTOM_HINTS.some((re) => re.test(speech));
+}
+
+function ensureEmpathy(reply) {
+  if (!reply) return reply;
+  // If reply already empathetic, keep it; else prefix a short line.
+  if (/(sorry|that’s|that's|understand|totally get)/i.test(reply)) return reply;
+  return `I'm sorry you're dealing with that. ${reply}`;
+}
+
 // small helper so we don't duplicate insert code
 async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (!text) return;
@@ -113,7 +136,7 @@ export default async function handler(req, res) {
         const lastSlots = lastAssistant?.meta?.slots || {};
 
         // timeout wrapper for /api/chat call
-        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '20000', 10); // ↑ prevent freezes
+        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '20000', 10);
         const t = withTimeout(CHAT_TIMEOUT_MS);
 
         const resp = await fetch(`${baseUrl}/api/chat`, {
@@ -140,8 +163,10 @@ export default async function handler(req, res) {
         reply = "Thanks. I heard you. Let’s keep going.";
       }
 
+      // Inject empathy if caller described a problem
+      let replyForTts = looksLikeAProblem(speech) ? ensureEmpathy(reply) : reply;
       // Normalize for TTS (H.V.A.C.)
-      const replyForTts = normalizeForTTS(reply);
+      replyForTts = normalizeForTTS(replyForTts);
 
       // 3) Log assistant turn WITH meta.slots
       await logTurn({
@@ -175,7 +200,7 @@ export default async function handler(req, res) {
         return sendXml(res, twiml);
       }
 
-      // Otherwise, continue the loop (longer listen + pacing)
+      // Otherwise, continue the loop with 1-second pacing
       const replyUrl = ttsUrlAbsolute(baseUrl, replyForTts);
 
       const twiml =
@@ -183,8 +208,8 @@ export default async function handler(req, res) {
 <Response>
   <Play>${replyUrl}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="4"/>
-  <Pause length="2"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1"/>
+  <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
@@ -208,15 +233,15 @@ export default async function handler(req, res) {
     }
   }
 
-  // FIRST TURN: remove the extra intro. We do NOT play a separate greeting here.
-  // We simply open the mic; the assistant's first reply (from chat.js) will be the only greeting.
+  // FIRST TURN: no separate greeting—AI handles it. 1s listen + pacing.
   const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="4"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1"/>
   <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
   return sendXml(res, twiml);
 }
+
