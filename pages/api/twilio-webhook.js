@@ -233,15 +233,21 @@ export default async function handler(req, res) {
     }
   }
 
-  // FIRST TURN: no separate greeting—AI handles it. 1s listen + pacing.
-  const twiml =
+  // FIRST TURN: Play Joy's intro ONCE at the start of the call.
+const intro = 'Welcome to H.V.A.C. Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+const introUrl = ttsUrlAbsolute(baseUrl, normalizeForTTS(intro));
+
+const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1">
+    <Play>${introUrl}</Play>
+  </Gather>
   <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
-  return sendXml(res, twiml);
+return sendXml(res, twiml);
+
 }
 
