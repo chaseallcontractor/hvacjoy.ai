@@ -76,7 +76,7 @@ slots schema:
 Behavior
 - Continue the call. Do not repeat the greeting.
 - Do NOT ask again for any slot already non-null in "known slots".
-- If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue; do not change topics.
+- If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.
 - Be apologetic/comforting right after the caller states a problem.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
@@ -96,7 +96,7 @@ async function fetchHistoryMessages(callSid) {
     const supabase = getSupabaseAdmin();
     const { data } = await supabase
       .from('call_transcripts')
-      .select('role, text, turn_index')
+      .select('role, text, turn_index') // meta not needed to render for the model
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: true })
       .limit(40);
@@ -111,7 +111,7 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
-// merge helper for slots
+// deep merge helper for slots
 function mergeSlots(oldSlots = {}, newSlots = {}) {
   const merged = { ...(oldSlots || {}) };
   for (const [k, v] of Object.entries(newSlots || {})) {
@@ -126,12 +126,12 @@ function mergeSlots(oldSlots = {}, newSlots = {}) {
   return merged;
 }
 
-// --- Heuristics to cover model/STT misses ---------------------------------
+// ---------- Heuristics to cover model/STT misses ---------------------------
 function inferPreferredWindowFrom(text) {
   const t = (text || '').toLowerCase();
   if (/\bmorning\b/.test(t)) return 'morning';
   if (/\bafternoon\b/.test(t)) return 'afternoon';
-  if (/\bevening\b/.test(t)) return 'afternoon'; // map evening → PM window
+  if (/\bevening\b/.test(t)) return 'afternoon'; // treat evening as PM window
   return null;
 }
 
@@ -209,7 +209,7 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Always steer to continue (webhook logs intro once on first turn)
+    // Always steer to continue (intro is handled/logged by webhook)
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
 

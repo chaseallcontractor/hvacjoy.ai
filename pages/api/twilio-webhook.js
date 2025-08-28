@@ -22,7 +22,7 @@ function ttsUrlAbsolute(baseUrl, text, voice) {
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
-// === Helpers ================================================================
+// ======================== Helpers =========================================
 
 // Insert a transcript row
 async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
@@ -38,29 +38,35 @@ async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (error) console.error('Supabase insert failed:', error.message);
 }
 
-// Abort controller helper
 function withTimeout(ms) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
-// Do we have any rows for this CallSid already?
-async function hasAnyTurnsForCall(supabase, callSid) {
+// Detect if we've already played/logged the intro
+async function introAlreadyPlayed(supabase, callSid) {
   if (!callSid) return false;
   try {
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('call_transcripts')
-      .select('turn_index', { head: true, count: 'exact' })
-      .eq('call_sid', callSid);
-    if (error) return false;
-    return (error?.count ?? 0) > 0 || (data?.length ?? 0) > 0;
-  } catch {
-    return false;
-  }
+      .select('role, meta, text')
+      .eq('call_sid', callSid)
+      .order('turn_index', { ascending: false })
+      .limit(20);
+
+    for (const row of (data || [])) {
+      if (row.role === 'assistant') {
+        if (row?.meta?.type === 'intro') return true;
+        const t = (row.text || '').toLowerCase();
+        if (t.includes('welcome to h.v.a.c joy')) return true; // fallback
+      }
+    }
+  } catch (_) {}
+  return false;
 }
 
-// Get the last assistant question text, if any (ends with "?")
+// Get the last assistant question text (ends with "?") or saved meta.last_question
 async function getLastAssistantQuestion(supabase, callSid) {
   try {
     const { data } = await supabase
@@ -68,15 +74,13 @@ async function getLastAssistantQuestion(supabase, callSid) {
       .select('role, text, meta, turn_index')
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: false })
-      .limit(10);
+      .limit(12);
 
     for (const row of (data || [])) {
-      if (row.role === 'assistant') {
-        // Prefer explicitly stored last_question; otherwise use text if it’s a question
-        if (row?.meta?.last_question) return String(row.meta.last_question);
-        const t = (row.text || '').trim();
-        if (t.endsWith('?')) return t;
-      }
+      if (row.role !== 'assistant') continue;
+      if (row?.meta?.last_question) return String(row.meta.last_question);
+      const t = (row.text || '').trim();
+      if (t.endsWith('?')) return t;
     }
   } catch (_) {}
   return null;
@@ -91,7 +95,7 @@ function isUnclear(text = '') {
   return false;
 }
 
-// Make a goodbye line from captured slots (respect call_ahead)
+// Build a slot-aware goodbye (respect call_ahead)
 function makeGoodbyeFromSlots(slots = {}) {
   const firstName = (slots.full_name || '').split(' ')[0] || '';
   const date = slots.preferred_date ? String(slots.preferred_date) : '';
@@ -104,7 +108,7 @@ function makeGoodbyeFromSlots(slots = {}) {
   return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit} Goodbye.`;
 }
 
-// If the model's reply promises a call-ahead but slot says no, normalize it
+// If the model's confirmation promises a call-ahead but slot says no, normalize it
 function normalizeCallAheadInText(text = '', slots = {}) {
   if (slots.call_ahead === false) {
     return text.replace(/(you'?ll|we will|we’ll).*call[- ]ahead.*?(?=\.|$)/gi,
@@ -113,7 +117,7 @@ function normalizeCallAheadInText(text = '', slots = {}) {
   return text;
 }
 
-// ===========================================================================
+// ======================== Handler =========================================
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -139,12 +143,11 @@ export default async function handler(req, res) {
 
   // ===== GREETING vs REPROMPT vs RE-ASK SAME QUESTION ======================
 
-  // If it's the very first request (no rows yet)
-  const seenTurns = await hasAnyTurnsForCall(supabase, callSid);
+  const introPlayed = await introAlreadyPlayed(supabase, callSid);
 
   // If nothing meaningful was heard
   if (!speech || isUnclear(speech)) {
-    if (!seenTurns) {
+    if (!introPlayed) {
       // TRUE FIRST TURN → greet once, and LOG it so the chat side knows
       const intro =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
@@ -183,7 +186,7 @@ export default async function handler(req, res) {
     // log caller turn
     await logTurn({ supabase, caller: from, callSid, text: speech, role: 'caller' });
 
-    // read last known slots from the most recent assistant turn, if any
+    // read last known slots & last question from the most recent assistant turn
     let lastSlots = {};
     let lastQuestion = null;
     try {
@@ -193,10 +196,11 @@ export default async function handler(req, res) {
         .eq('call_sid', callSid)
         .order('turn_index', { ascending: false })
         .limit(6);
+
       const lastAssistant = (lastTurns || []).find(t => t.role === 'assistant');
       if (lastAssistant?.meta?.slots) lastSlots = lastAssistant.meta.slots;
       if (lastAssistant?.meta?.last_question) lastQuestion = lastAssistant.meta.last_question;
-      else if ((lastAssistant?.text || '').trim().endsWith('?')) lastQuestion = lastAssistant.text.trim();
+      else if ((lastAssistant?.text || '').trim().endsWith('?')) lastQuestion = (lastAssistant.text || '').trim();
     } catch (_) {}
 
     // call our chat brain with timeout
