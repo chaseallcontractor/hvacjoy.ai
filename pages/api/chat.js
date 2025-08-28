@@ -10,6 +10,7 @@ Voice & Style
 - Warm, professional, concise. Short sentences (<= 14 words).
 - Acknowledge and comfort after the caller states a problem.
 - Confirm important items briefly after capturing them.
+- Do not use meta language (e.g., “I already answered your questions”). Be forward-looking and helpful.
 
 Safety & Guardrails
 - Only give these prices:
@@ -20,8 +21,7 @@ Safety & Guardrails
 - Ask permission before any hold.
 
 Call Flow
-1) Greeting (only once per call):
-   "Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?"
+1) Greeting (only once per call).
 2) Capture + confirm:
    - Full name
    - Service address (line1, city, state, zip) + gate/parking notes
@@ -74,8 +74,9 @@ slots schema:
 }
 
 Behavior
-- Use conversation context below. Do NOT repeat the greeting once said.
+- Continue the call. Do not repeat the greeting.
 - Do NOT ask again for any slot already non-null in "known slots".
+- If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue; do not change topics.
 - Be apologetic/comforting right after the caller states a problem.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
@@ -110,7 +111,7 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
-// deep merge helper for slots
+// merge helper for slots
 function mergeSlots(oldSlots = {}, newSlots = {}) {
   const merged = { ...(oldSlots || {}) };
   for (const [k, v] of Object.entries(newSlots || {})) {
@@ -125,7 +126,7 @@ function mergeSlots(oldSlots = {}, newSlots = {}) {
   return merged;
 }
 
-// --- NEW: tiny heuristics to cover model misses ---
+// --- Heuristics to cover model/STT misses ---------------------------------
 function inferPreferredWindowFrom(text) {
   const t = (text || '').toLowerCase();
   if (/\bmorning\b/.test(t)) return 'morning';
@@ -136,30 +137,47 @@ function inferPreferredWindowFrom(text) {
 
 function statementMentionsPricing(text) {
   const t = (text || '').toLowerCase();
-  // catch “diagnostic … $50”, “$50 diagnostic”, etc.
   return /\bdiagnostic\b/.test(t) && /(?:\$|usd\s*)?50\b/.test(t);
+}
+
+function inferYesNoCallAhead(text) {
+  const t = (text || '').toLowerCase();
+  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay)\b/.test(t)) return true;
+  if (/\b(no|nope|nah|don’t|do not|no thanks|not necessary)\b/.test(t)) return false;
+  return null;
+}
+
+// Find the last assistant question in history (ends with "?")
+function getLastAssistantQuestion(history) {
+  const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
+  for (let i = assistantLines.length - 1; i >= 0; i--) {
+    const line = (assistantLines[i] || '').trim();
+    if (line.endsWith('?')) return line;
+  }
+  return null;
 }
 
 function applyHeuristics(mergedSlots, history, latestUser, latestAssistant) {
   const slots = { ...(mergedSlots || {}) };
 
-  // If window still missing, infer it from the caller's last utterance.
   if (!slots.preferred_window) {
     const win = inferPreferredWindowFrom(latestUser);
     if (win) slots.preferred_window = win;
   }
 
-  // If pricing not marked, scan recent assistant lines (including the latest).
   if (slots.pricing_disclosed !== true) {
     const lastAssistantLines = [...history, { role: 'assistant', content: latestAssistant || '' }]
       .filter(m => m.role === 'assistant')
       .slice(-8)
       .map(m => m.content || '');
-
     if (lastAssistantLines.some(statementMentionsPricing)) {
       slots.pricing_disclosed = true;
     }
   }
+
+  // Infer/overwrite call_ahead from latest utterance (latest wins)
+  const inferred = inferYesNoCallAhead(latestUser);
+  if (inferred !== null) slots.call_ahead = inferred;
 
   return slots;
 }
@@ -173,7 +191,6 @@ function serverSideDoneCheck(slots) {
     !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
     s.pricing_disclosed === true &&
     (s.preferred_date || s.preferred_window);
-
   return basics;
 }
 
@@ -184,7 +201,7 @@ export default async function handler(req, res) {
   }
 
   try {
-    const { speech = '', caller = '', callSid = '', lastSlots = {} } = req.body || {};
+    const { speech = '', caller = '', callSid = '', lastSlots = {}, lastQuestion = '' } = req.body || {};
     if (!speech) return res.status(400).json({ error: 'Missing "speech" in body' });
 
     const apiKey = process.env.OPENAI_API_KEY;
@@ -192,18 +209,16 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    const greetingSaid = history.some(
-      m => m.role === 'assistant' &&
-        m.content.toLowerCase().includes('welcome to h.v.a.c joy')
-    );
+    // Always steer to continue (webhook logs intro once on first turn)
+    const priorLastQuestion = getLastAssistantQuestion(history) || '';
+    const lastQ = lastQuestion || priorLastQuestion;
 
     const steering =
-      (greetingSaid
-        ? 'Continue the call. Do not repeat the greeting.'
-        : 'Start with the greeting, then begin capture.'
-      )
-      + '\nKnown slots (do not re-ask if non-null):\n'
-      + JSON.stringify(lastSlots || {}, null, 2);
+      'Continue the call. Do not repeat the greeting.' +
+      '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
+      (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
+      '\nKnown slots (do not re-ask if non-null):\n' +
+      JSON.stringify(lastSlots || {}, null, 2);
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -258,6 +273,7 @@ export default async function handler(req, res) {
       };
     }
 
+    // ensure reply and slots
     if (typeof parsed.reply !== 'string') {
       parsed.reply = "Thanks. What’s the next detail—street address, city, and zip?";
     }
@@ -266,10 +282,10 @@ export default async function handler(req, res) {
     // merge with old slots
     let mergedSlots = mergeSlots(lastSlots, parsed.slots);
 
-    // --- apply heuristics to cover model misses ---
+    // heuristics
     mergedSlots = applyHeuristics(mergedSlots, history, speech, parsed.reply);
 
-    // server-side done check
+    // done?
     const done = parsed.done === true || serverSideDoneCheck(mergedSlots);
     const goodbye = done
       ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")

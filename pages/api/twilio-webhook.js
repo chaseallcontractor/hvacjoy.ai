@@ -22,7 +22,9 @@ function ttsUrlAbsolute(baseUrl, text, voice) {
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
-// log helper
+// === Helpers ================================================================
+
+// Insert a transcript row
 async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (!text && !meta) return;
   const { error } = await supabase.from('call_transcripts').insert([{
@@ -36,21 +38,82 @@ async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (error) console.error('Supabase insert failed:', error.message);
 }
 
+// Abort controller helper
 function withTimeout(ms) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
-// --- NEW: make a friendly, slot-aware goodbye if we have details ---
+// Do we have any rows for this CallSid already?
+async function hasAnyTurnsForCall(supabase, callSid) {
+  if (!callSid) return false;
+  try {
+    const { data, error } = await supabase
+      .from('call_transcripts')
+      .select('turn_index', { head: true, count: 'exact' })
+      .eq('call_sid', callSid);
+    if (error) return false;
+    return (error?.count ?? 0) > 0 || (data?.length ?? 0) > 0;
+  } catch {
+    return false;
+  }
+}
+
+// Get the last assistant question text, if any (ends with "?")
+async function getLastAssistantQuestion(supabase, callSid) {
+  try {
+    const { data } = await supabase
+      .from('call_transcripts')
+      .select('role, text, meta, turn_index')
+      .eq('call_sid', callSid)
+      .order('turn_index', { ascending: false })
+      .limit(10);
+
+    for (const row of (data || [])) {
+      if (row.role === 'assistant') {
+        // Prefer explicitly stored last_question; otherwise use text if it’s a question
+        if (row?.meta?.last_question) return String(row.meta.last_question);
+        const t = (row.text || '').trim();
+        if (t.endsWith('?')) return t;
+      }
+    }
+  } catch (_) {}
+  return null;
+}
+
+// Treat obviously noisy STT as “not understood”
+function isUnclear(text = '') {
+  const t = (text || '').trim().toLowerCase();
+  if (!t) return true;                 // silence
+  if (t.length <= 2) return true;      // very short grunts
+  if (/\b(play|he told|audio|uh|umm?|hmm?)\b/.test(t)) return true;
+  return false;
+}
+
+// Make a goodbye line from captured slots (respect call_ahead)
 function makeGoodbyeFromSlots(slots = {}) {
   const firstName = (slots.full_name || '').split(' ')[0] || '';
   const date = slots.preferred_date ? String(slots.preferred_date) : '';
   const window = slots.preferred_window ? ` in the ${slots.preferred_window} window` : '';
   const when = date ? ` on ${date}${window}` : (window || '');
   const nameBit = firstName ? `, ${firstName}` : '';
-  return `Thank you${nameBit}. You’re scheduled${when}. We’ll call ahead before arriving. Goodbye.`;
+  const callAheadBit = (slots.call_ahead === false)
+    ? ' We will arrive within your window without a call-ahead.'
+    : ' We will call ahead before arriving.';
+  return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit} Goodbye.`;
 }
+
+// If the model's reply promises a call-ahead but slot says no, normalize it
+function normalizeCallAheadInText(text = '', slots = {}) {
+  if (slots.call_ahead === false) {
+    return text.replace(/(you'?ll|we will|we’ll).*call[- ]ahead.*?(?=\.|$)/gi,
+      'You are set in the selected arrival window');
+  }
+  return text;
+}
+
+// ===========================================================================
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
@@ -58,7 +121,7 @@ export default async function handler(req, res) {
     return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
-  // parse Twilio form body
+  // Parse Twilio form body
   let rawBody = '';
   await new Promise((resolve) => {
     req.on('data', (chunk) => (rawBody += chunk));
@@ -68,20 +131,26 @@ export default async function handler(req, res) {
 
   const from = body.From || 'Unknown';
   const callSid = body.CallSid || null;
-  const speech = body.SpeechResult || '';           // may be empty
+  const speech = body.SpeechResult || ''; // may be empty
   const baseUrl = baseUrlFromReq(req);
   const actionUrl = `${baseUrl}/api/twilio-webhook`;
 
   const supabase = getSupabaseAdmin();
 
-  // First turn greeting (single intro)
-  if (!speech) {
-    const intro =
-      'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+  // ===== GREETING vs REPROMPT vs RE-ASK SAME QUESTION ======================
 
-    const introUrl = ttsUrlAbsolute(baseUrl, intro);
+  // If it's the very first request (no rows yet)
+  const seenTurns = await hasAnyTurnsForCall(supabase, callSid);
 
-    const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+  // If nothing meaningful was heard
+  if (!speech || isUnclear(speech)) {
+    if (!seenTurns) {
+      // TRUE FIRST TURN → greet once, and LOG it so the chat side knows
+      const intro =
+        'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+      await logTurn({ supabase, caller: from, callSid, text: intro, role: 'assistant', meta: { type: 'intro' } });
+      const introUrl = ttsUrlAbsolute(baseUrl, intro);
+      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${introUrl}</Play>
   <Pause length="1"/>
@@ -91,25 +160,43 @@ export default async function handler(req, res) {
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" language="en-US"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
-    return sendXml(res, twiml);
+      return sendXml(res, twiml);
+    } else {
+      // MID-CALL UNCLEAR → re-ask the same question (NOT the greeting)
+      const lastQ = await getLastAssistantQuestion(supabase, callSid);
+      const prompt = lastQ || 'Sorry, I didn’t catch that. Could you please repeat that?';
+      const url = ttsUrlAbsolute(baseUrl, prompt);
+      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${url}</Play>
+  <Pause length="1"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" language="en-US"/>
+  <Redirect method="POST">${actionUrl}</Redirect>
+</Response>`;
+      return sendXml(res, twiml);
+    }
   }
 
-  // we have caller speech → loop
+  // ===== We have caller speech → normal loop ===============================
+
   try {
     // log caller turn
     await logTurn({ supabase, caller: from, callSid, text: speech, role: 'caller' });
 
     // read last known slots from the most recent assistant turn, if any
     let lastSlots = {};
+    let lastQuestion = null;
     try {
       const { data: lastTurns } = await supabase
         .from('call_transcripts')
-        .select('role, meta, turn_index')
+        .select('role, meta, text, turn_index')
         .eq('call_sid', callSid)
         .order('turn_index', { ascending: false })
-        .limit(5);
+        .limit(6);
       const lastAssistant = (lastTurns || []).find(t => t.role === 'assistant');
       if (lastAssistant?.meta?.slots) lastSlots = lastAssistant.meta.slots;
+      if (lastAssistant?.meta?.last_question) lastQuestion = lastAssistant.meta.last_question;
+      else if ((lastAssistant?.text || '').trim().endsWith('?')) lastQuestion = lastAssistant.text.trim();
     } catch (_) {}
 
     // call our chat brain with timeout
@@ -125,7 +212,7 @@ export default async function handler(req, res) {
       const resp = await fetch(`${baseUrl}/api/chat`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ caller: from, speech, callSid, lastSlots }),
+        body: JSON.stringify({ caller: from, speech, callSid, lastSlots, lastQuestion }),
         signal: t.signal,
       }).catch(e => { throw e; })
         .finally(() => t.cancel());
@@ -146,9 +233,16 @@ export default async function handler(req, res) {
       reply = "Thanks. I heard you. Give me just a moment.";
     }
 
-    // log assistant turn (store merged slots so next turn won’t re-ask)
+    // If the model's confirmation contradicts call_ahead=false, normalize
+    reply = normalizeCallAheadInText(reply, slots);
+
+    // log assistant turn; save last_question if this reply ends with "?"
+    const meta = { slots, done, goodbye };
+    const trimmed = (reply || '').trim();
+    if (trimmed.endsWith('?')) meta.last_question = trimmed;
+
     await logTurn({
-      supabase, caller: from, callSid, text: reply, role: 'assistant', meta: { slots, done, goodbye }
+      supabase, caller: from, callSid, text: reply, role: 'assistant', meta
     });
 
     if (done) {
