@@ -98,7 +98,7 @@ async function fetchHistoryMessages(callSid) {
       .select('role, text, turn_index')
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: true })
-      .limit(20);
+      .limit(40);
 
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
@@ -123,6 +123,45 @@ function mergeSlots(oldSlots = {}, newSlots = {}) {
     }
   }
   return merged;
+}
+
+// --- NEW: tiny heuristics to cover model misses ---
+function inferPreferredWindowFrom(text) {
+  const t = (text || '').toLowerCase();
+  if (/\bmorning\b/.test(t)) return 'morning';
+  if (/\bafternoon\b/.test(t)) return 'afternoon';
+  if (/\bevening\b/.test(t)) return 'afternoon'; // map evening → PM window
+  return null;
+}
+
+function statementMentionsPricing(text) {
+  const t = (text || '').toLowerCase();
+  // catch “diagnostic … $50”, “$50 diagnostic”, etc.
+  return /\bdiagnostic\b/.test(t) && /(?:\$|usd\s*)?50\b/.test(t);
+}
+
+function applyHeuristics(mergedSlots, history, latestUser, latestAssistant) {
+  const slots = { ...(mergedSlots || {}) };
+
+  // If window still missing, infer it from the caller's last utterance.
+  if (!slots.preferred_window) {
+    const win = inferPreferredWindowFrom(latestUser);
+    if (win) slots.preferred_window = win;
+  }
+
+  // If pricing not marked, scan recent assistant lines (including the latest).
+  if (slots.pricing_disclosed !== true) {
+    const lastAssistantLines = [...history, { role: 'assistant', content: latestAssistant || '' }]
+      .filter(m => m.role === 'assistant')
+      .slice(-8)
+      .map(m => m.content || '');
+
+    if (lastAssistantLines.some(statementMentionsPricing)) {
+      slots.pricing_disclosed = true;
+    }
+  }
+
+  return slots;
 }
 
 function serverSideDoneCheck(slots) {
@@ -155,7 +194,7 @@ export default async function handler(req, res) {
 
     const greetingSaid = history.some(
       m => m.role === 'assistant' &&
-        m.content.toLowerCase().includes('welcome to h.v.a.c joy') // our intro
+        m.content.toLowerCase().includes('welcome to h.v.a.c joy')
     );
 
     const steering =
@@ -219,16 +258,18 @@ export default async function handler(req, res) {
       };
     }
 
-    // ensure reply and slots
     if (typeof parsed.reply !== 'string') {
       parsed.reply = "Thanks. What’s the next detail—street address, city, and zip?";
     }
     if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
-    // merge with old slots so we keep memory across turns
-    const mergedSlots = mergeSlots(lastSlots, parsed.slots);
+    // merge with old slots
+    let mergedSlots = mergeSlots(lastSlots, parsed.slots);
 
-    // server-side done check (in case model forgets)
+    // --- apply heuristics to cover model misses ---
+    mergedSlots = applyHeuristics(mergedSlots, history, speech, parsed.reply);
+
+    // server-side done check
     const done = parsed.done === true || serverSideDoneCheck(mergedSlots);
     const goodbye = done
       ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")

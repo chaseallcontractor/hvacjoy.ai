@@ -1,7 +1,4 @@
 // pages/api/twilio-webhook.js
-// Twilio Voice webhook: log caller + assistant turns to Supabase,
-// call /api/chat for the reply, then Play ElevenLabs TTS.
-
 import querystring from 'querystring';
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
@@ -45,6 +42,16 @@ function withTimeout(ms) {
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
+// --- NEW: make a friendly, slot-aware goodbye if we have details ---
+function makeGoodbyeFromSlots(slots = {}) {
+  const firstName = (slots.full_name || '').split(' ')[0] || '';
+  const date = slots.preferred_date ? String(slots.preferred_date) : '';
+  const window = slots.preferred_window ? ` in the ${slots.preferred_window} window` : '';
+  const when = date ? ` on ${date}${window}` : (window || '');
+  const nameBit = firstName ? `, ${firstName}` : '';
+  return `Thank you${nameBit}. You’re scheduled${when}. We’ll call ahead before arriving. Goodbye.`;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -67,7 +74,7 @@ export default async function handler(req, res) {
 
   const supabase = getSupabaseAdmin();
 
-  // First turn greeting (single intro as requested)
+  // First turn greeting (single intro)
   if (!speech) {
     const intro =
       'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
@@ -78,9 +85,7 @@ export default async function handler(req, res) {
 <Response>
   <Play>${introUrl}</Play>
   <Pause length="1"/>
-  <!-- Keep Joy fast, but let caller finish naturally -->
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" language="en-US"/>
-  <!-- If Twilio didn’t detect speech, politely reprompt once -->
   <Play>${ttsUrlAbsolute(baseUrl, "Sorry, I didn’t catch that. Could you repeat that?")}</Play>
   <Pause length="1"/>
   <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" language="en-US"/>
@@ -148,7 +153,7 @@ export default async function handler(req, res) {
 
     if (done) {
       const replyUrl = ttsUrlAbsolute(baseUrl, reply);
-      const byeText = goodbye || "Thank you. You’re all set. We’ll call ahead. Goodbye.";
+      const byeText = (goodbye && goodbye.trim()) ? goodbye : makeGoodbyeFromSlots(slots);
       const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -160,7 +165,7 @@ export default async function handler(req, res) {
       return sendXml(res, twiml);
     }
 
-    // continue loop — keep Joy quick (1s), but let caller finish naturally
+    // continue loop
     const replyUrl = ttsUrlAbsolute(baseUrl, reply);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
