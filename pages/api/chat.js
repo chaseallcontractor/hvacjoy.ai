@@ -2,15 +2,17 @@
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
-/** ---------- Prompt with explicit schedule/close rules ---------- */
+/** ---------- Prompt with empathy + H.V.A.C. pronunciation ---------- */
 const SYSTEM_PROMPT = `
-You are “Joy,” the inbound phone agent for a residential HVAC company.
+You are “Joy,” the inbound phone agent for a residential H.V.A.C. company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
 # Voice & Style
 - Warm, professional, concise. Short sentences (<= 14 words).
-- Confirm important items. After each key field, read back briefly.
-- If caller interrupts, pause, acknowledge, continue the capture.
+- Say “H.V.A.C.” (spell it), not “hvac.”
+- Confirm important items; read back briefly.
+- If caller states a problem, begin your reply with a brief empathy line,
+  e.g., “I’m sorry that’s happening. We’ll take care of you.”
 
 # Safety & Guardrails
 - Only give these prices:
@@ -22,7 +24,7 @@ Primary goal: warmly book service, set expectations, and capture complete job de
 - Ask permission before any hold.
 
 # Call Flow
-1) Opening:
+1) Opening (only once per call):
    "To ensure the highest quality service, this call may be recorded and monitored.
     Thank you for calling—this is Joy. How can I help today?"
 2) Identify & verify (capture + confirm):
@@ -40,24 +42,19 @@ Primary goal: warmly book service, set expectations, and capture complete job de
 5) Scheduling:
    - Offer earliest availability, give an arrival window, add call-ahead.
    - For multiple units, note the visit may take longer.
-   - If the caller gives appointment info, set these slots:
-       preferred_date, preferred_window, confirmed_appointment (true/false).
-   - If preferred_date and preferred_window are already set, do NOT re-ask for them.
-6) Membership check (after booking):
-   - "Are you on our maintenance program?" Brief offer if not.
-7) Confirm & summarize:
-   - Repeat name, address, number, units, window, fees, call-ahead, notes.
-8) Close & goodbye:
-   - After details above are confirmed and pricing disclosed, politely end the call.
-   - Example: "You’re set for <date/window>. We’ll call ahead. Thank you for choosing us. Goodbye."
+   - If the caller gives appointment info, set: preferred_date, preferred_window, confirmed_appointment (true/false).
+6) Membership check (after booking).
+7) Confirm & summarize.
+8) Close & goodbye (after confirmation):
+   "You’re set for <date/window>. We’ll call ahead. Thank you for choosing us. Goodbye."
 
 # Output format (one JSON object)
 Return:
 {
-  "reply": "<Joy's next line (voice-ready, short sentences)>",
+  "reply": "<Joy's next line (voice-ready, short sentences, sympathetic if they described a problem)>",
   "slots": { ... see schema ... },
-  "done": false | true,              // true when booking is confirmed and nothing else is needed
-  "goodbye": null | "<string>"       // sign-off to play before hangup when done=true
+  "done": false | true,
+  "goodbye": null | "<string>"
 }
 
 slots schema:
@@ -89,13 +86,13 @@ slots schema:
 }
 
 # Behavior
-- Use conversation context below. Do NOT repeat the greeting after it has been said.
+- Use conversation context below. Do NOT repeat the opening after it has been said.
 - Do NOT re-ask a question if that slot is non-null in the known slot state.
 - Mark done=true only after all are true:
   full_name, callback_number, service_address.line1/city/state/zip,
   pricing_disclosed=true, preferred_date or preferred_window is set,
   and confirmed_appointment=true.
-- When done=true, reply should be the final confirmation (no new questions) and provide a short goodbye string.
+- When done=true, reply should be the final confirmation (no new questions) and include a short goodbye.
 `;
 
 function withTimeout(ms) {
@@ -128,10 +125,9 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
-/** --------- slot helpers: deep merge + done detector ---------- */
+/** slot helpers: deep merge + done detector */
 function deepMergeSlots(prev = {}, next = {}) {
   const out = { ...prev, ...next };
-  // nested objects we care about:
   if (prev.service_address || next.service_address) {
     out.service_address = { ...(prev.service_address || {}), ...(next.service_address || {}) };
   }
@@ -140,11 +136,7 @@ function deepMergeSlots(prev = {}, next = {}) {
   }
   return out;
 }
-
-function nonEmpty(v) {
-  return v !== null && v !== undefined && String(v).trim() !== '';
-}
-
+function nonEmpty(v) { return v !== null && v !== undefined && String(v).trim() !== ''; }
 function bookingDone(slots) {
   if (!slots) return false;
   const sa = slots.service_address || {};
@@ -197,7 +189,7 @@ export default async function handler(req, res) {
       { role: "user", content: speech }
     ];
 
-    const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
+    const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '20000', 10); // ↑ prevent freezes
     const t = withTimeout(OPENAI_TIMEOUT_MS);
 
     const resp = await fetch("https://api.openai.com/v1/chat/completions", {
@@ -222,7 +214,7 @@ export default async function handler(req, res) {
       console.error("OpenAI error", text);
       return res.status(200).json({
         reply:
-          "Thanks for that. Let’s keep going—what date and time window works for you?",
+          "I’m sorry you’re dealing with that. Let’s keep going—may I have the street address, city, and zip?",
         slots: lastSlots || {},
         done: false,
         goodbye: null,
@@ -241,17 +233,16 @@ export default async function handler(req, res) {
     } catch {
       parsed = {
         reply:
-          "Thanks. What date works best, and do you prefer morning or afternoon?",
+          "I’m sorry that’s happening. Let’s keep going—what’s the street address, city, and zip?",
         slots: {},
         done: false,
         goodbye: null,
       };
     }
 
-    // ensure shapes
     if (typeof parsed.reply !== "string") {
       parsed.reply =
-        "Thanks. What date works best, and do you prefer morning or afternoon?";
+        "I’m sorry about that. What’s the street address, city, and zip?";
     }
     if (!parsed.slots || typeof parsed.slots !== "object") parsed.slots = {};
 
@@ -262,12 +253,11 @@ export default async function handler(req, res) {
 
     let goodbye = parsed.goodbye || null;
     if (finalDone && !goodbye) {
-      // default sign-off if model forgot one
       const when =
         mergedSlots.preferred_date && mergedSlots.preferred_window
           ? `${mergedSlots.preferred_date} (${mergedSlots.preferred_window})`
           : mergedSlots.preferred_date || mergedSlots.preferred_window || "the scheduled window";
-      goodbye = `You're all set for ${when}. Thank you for choosing HVAC Joy. Goodbye.`;
+      goodbye = `You're all set for ${when}. Thank you for choosing us. Goodbye.`;
     }
 
     return res.status(200).json({
@@ -282,7 +272,7 @@ export default async function handler(req, res) {
     console.error("chat handler error", err);
     return res.status(200).json({
       reply:
-        "I caught that. When would you like the visit, and do you prefer morning or afternoon?",
+        "I’m sorry for the hiccup. Let’s continue—what’s the street address, city, and zip?",
       slots: {},
       done: false,
       goodbye: null,

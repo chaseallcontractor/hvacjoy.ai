@@ -28,6 +28,14 @@ function ttsUrlAbsolute(baseUrl, text, voice) {
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
+// Replace HVAC with H.V.A.C. so TTS pronounces it correctly.
+function normalizeForTTS(s) {
+  if (!s) return s;
+  return s
+    .replace(/\bHVAC\b/gi, 'H.V.A.C.')
+    .replace(/\bHvac\b/g, 'H.V.A.C.');
+}
+
 // small helper so we don't duplicate insert code
 async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (!text) return;
@@ -87,7 +95,7 @@ export default async function handler(req, res) {
       });
 
       // 2) Ask your chat endpoint for the assistant reply (+ slots + done)
-      let reply = "Thanks — one moment.";
+      let reply = "Thanks—one moment.";
       let slots = { pricing_disclosed: false, emergency: false };
       let done = false;
       let goodbye = null;
@@ -105,7 +113,7 @@ export default async function handler(req, res) {
         const lastSlots = lastAssistant?.meta?.slots || {};
 
         // timeout wrapper for /api/chat call
-        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '12000', 10);
+        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '20000', 10); // ↑ prevent freezes
         const t = withTimeout(CHAT_TIMEOUT_MS);
 
         const resp = await fetch(`${baseUrl}/api/chat`, {
@@ -125,29 +133,34 @@ export default async function handler(req, res) {
         } else {
           const text = await resp?.text();
           console.error('Chat API error:', text);
-          reply = "Thanks. I caught that. One moment while I get the next step.";
+          reply = "Thanks. I captured that. Let’s keep going.";
         }
       } catch (e) {
         console.error('Chat API error:', e);
-        reply = "Thanks. I heard you. Give me just a moment.";
+        reply = "Thanks. I heard you. Let’s keep going.";
       }
+
+      // Normalize for TTS (H.V.A.C.)
+      const replyForTts = normalizeForTTS(reply);
 
       // 3) Log assistant turn WITH meta.slots
       await logTurn({
         supabase,
         caller: from,
         callSid,
-        text: reply,
+        text: replyForTts,
         role: 'assistant',
         meta: { slots, done, goodbye },
       });
 
       // 4) Build TwiML depending on whether we're finished
       if (done) {
-        const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+        const replyUrl = ttsUrlAbsolute(baseUrl, replyForTts);
         const byeText =
-          goodbye ||
-          "Thank you. You’re all set. We look forward to helping you. Goodbye.";
+          normalizeForTTS(
+            goodbye ||
+            "Thank you. You’re all set. We look forward to helping you. Goodbye."
+          );
         const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
 
         const twiml =
@@ -163,14 +176,14 @@ export default async function handler(req, res) {
       }
 
       // Otherwise, continue the loop (longer listen + pacing)
-      const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+      const replyUrl = ttsUrlAbsolute(baseUrl, replyForTts);
 
       const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${replyUrl}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="3"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="4"/>
   <Pause length="2"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
@@ -181,7 +194,7 @@ export default async function handler(req, res) {
 
       const fallbackUrl = ttsUrlAbsolute(
         baseUrl,
-        'Sorry, I ran into a problem. I will connect you to a live agent.'
+        normalizeForTTS('Sorry, I hit a snag. I will connect you to a teammate.')
       );
 
       const twiml =
@@ -195,17 +208,13 @@ export default async function handler(req, res) {
     }
   }
 
-  // First turn greeting (play, then listen)
-  const greeting = 'Thanks for calling HVAC Joy. Please briefly describe your issue after the tone.';
-  const greetingUrl = ttsUrlAbsolute(baseUrl, greeting);
-
+  // FIRST TURN: remove the extra intro. We do NOT play a separate greeting here.
+  // We simply open the mic; the assistant's first reply (from chat.js) will be the only greeting.
   const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="3">
-    <Play>${greetingUrl}</Play>
-  </Gather>
-  <Pause length="2"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="4"/>
+  <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
 
