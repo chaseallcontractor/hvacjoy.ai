@@ -1,13 +1,11 @@
 // pages/api/twilio-webhook.js
-// Twilio Voice webhook: log caller + assistant turns to Supabase,
-// call /api/chat for the reply, then Play ElevenLabs TTS.
+// Twilio Voice webhook: logs turns to Supabase, calls /api/chat for reply,
+// plays ElevenLabs TTS, and loops. Handles first-turn intro + no-speech nudges.
 
 import querystring from 'querystring';
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
-export const config = {
-  api: { bodyParser: false },
-};
+export const config = { api: { bodyParser: false } };
 
 function sendXml(res, twiml) {
   res.setHeader('Content-Type', 'text/xml');
@@ -15,63 +13,36 @@ function sendXml(res, twiml) {
 }
 
 function baseUrlFromReq(req) {
-  // Prefer forwarded headers from Cloudflare/Render; default to https
   const protoHeader = req.headers['x-forwarded-proto'] || '';
   const proto = protoHeader.split(',')[0]?.trim() || 'https';
   const host = req.headers['x-forwarded-host'] || req.headers.host;
   return `${proto}://${host}`;
 }
 
+// Ensure “H.V.A.C.”, brand spellings, etc. come out right in TTS.
+function normalizeForTTS(s) {
+  return String(s || '')
+    .replace(/\bHVAC\b/gi, 'H.V.A.C.') // spell out HVAC
+    .replace(/\bA\/C\b/gi, 'A C');     // common cleanup for A/C
+}
+
 function ttsUrlAbsolute(baseUrl, text, voice) {
-  const params = new URLSearchParams({ text });
+  const params = new URLSearchParams({ text: normalizeForTTS(text) });
   if (voice) params.set('voice', voice);
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
-// Replace HVAC with H.V.A.C. so TTS pronounces it correctly.
-function normalizeForTTS(s) {
-  if (!s) return s;
-  return s
-    .replace(/\bHVAC\b/gi, 'H.V.A.C.')
-    .replace(/\bHvac\b/g, 'H.V.A.C.');
-}
-
-// Simple detector for “problem” statements; triggers empathy injection.
-const SYMPTOM_HINTS = [
-  /no (cool|cooling|heat|heating)/i,
-  /(blowing|blows) (hot|warm|cold)/i,
-  /(not|won[’']?t) (work|turn on|start|run)/i,
-  /broke|broken|down|leak|leaking|ice|icing|iced|smell|odor/i,
-  /loud|noise|noisy|buzz|grind|rattle|bang/i,
-  /thermostat.*(not|won[’']?t)/i,
-  /error|fault|alarm|code/i,
-];
-
-function looksLikeAProblem(speech) {
-  if (!speech) return false;
-  return SYMPTOM_HINTS.some((re) => re.test(speech));
-}
-
-function ensureEmpathy(reply) {
-  if (!reply) return reply;
-  // If reply already empathetic, keep it; else prefix a short line.
-  if (/(sorry|that’s|that's|understand|totally get)/i.test(reply)) return reply;
-  return `I'm sorry you're dealing with that. ${reply}`;
-}
-
-// small helper so we don't duplicate insert code
+// Small helper so we don't duplicate insert code
 async function logTurn({ supabase, caller, callSid, text, role, meta = {} }) {
   if (!text) return;
-  const { error } = await supabase.from('call_transcripts').insert([
-    {
-      caller_phone: caller || null,
-      text: String(text).slice(0, 5000),
-      role, // 'caller' | 'assistant'
-      call_sid: callSid || null,
-      turn_index: Date.now(), // bigint-friendly
-      meta,
-    },
-  ]);
+  const { error } = await supabase.from('call_transcripts').insert([{
+    caller_phone: caller || null,
+    text: String(text).slice(0, 5000),
+    role, // 'caller' | 'assistant'
+    call_sid: callSid || null,
+    turn_index: Date.now(), // bigint-friendly
+    meta,
+  }]);
   if (error) console.error('Supabase insert failed:', error.message);
 }
 
@@ -79,6 +50,27 @@ function withTimeout(ms) {
   const controller = new AbortController();
   const id = setTimeout(() => controller.abort(), ms);
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
+}
+
+// Pick the next question from the last known slots when caller is silent
+function nextQuestionFromSlots(slots = {}) {
+  const addr = slots.service_address || {};
+  if (!slots.full_name) return "May I have your full name, please?";
+  if (!addr.line1 || !addr.city || !addr.state || !addr.zip)
+    return "What is the street address, city, state, and zip code for the visit?";
+  if (!slots.callback_number) return "What’s the best callback number if we get disconnected?";
+  if (slots.unit_count == null) return "How many H.V.A.C. systems are affected, and where are they located?";
+  if (!slots.brand) return "Do you happen to know the brand of the system?";
+  if (!Array.isArray(slots.symptoms) || slots.symptoms.length === 0)
+    return "What symptoms are you noticing—no cooling, weak airflow, noises, or icing?";
+  const th = slots.thermostat || {};
+  if (th.setpoint == null || th.current == null)
+    return "What is the thermostat setpoint, and what does it read right now?";
+  if (slots.pricing_disclosed !== true)
+    return "Our diagnostic visit is $50 per non-working unit. Shall I proceed with scheduling?";
+  if (!slots.preferred_date && !slots.preferred_window)
+    return "What day works for you, and do you prefer morning, afternoon, or flexible-all-day?";
+  return "Is there anything else I should note—gate codes, pets, or parking notes?";
 }
 
 export default async function handler(req, res) {
@@ -99,32 +91,23 @@ export default async function handler(req, res) {
   const callSid = body.CallSid || null;
   const speech = body.SpeechResult || '';
 
-  // Precompute absolute URLs
   const baseUrl = baseUrlFromReq(req);
   const actionUrl = `${baseUrl}/api/twilio-webhook`;
+
+  const supabase = getSupabaseAdmin();
 
   // If caller spoke, log it, get the AI reply, log it, and respond with TTS
   if (speech) {
     try {
-      const supabase = getSupabaseAdmin();
+      await logTurn({ supabase, caller: from, callSid, text: speech, role: 'caller' });
 
-      // 1) Log caller turn
-      await logTurn({
-        supabase,
-        caller: from,
-        callSid,
-        text: speech,
-        role: 'caller',
-      });
-
-      // 2) Ask your chat endpoint for the assistant reply (+ slots + done)
-      let reply = "Thanks—one moment.";
+      let reply = "Thanks — one moment.";
       let slots = { pricing_disclosed: false, emergency: false };
       let done = false;
       let goodbye = null;
 
       try {
-        // read last assistant meta.slots if available (helps avoid re-asking)
+        // Read last assistant slots to help /api/chat avoid re-asking
         const { data: lastTurns } = await supabase
           .from('call_transcripts')
           .select('role, meta, turn_index')
@@ -135,8 +118,7 @@ export default async function handler(req, res) {
         const lastAssistant = (lastTurns || []).find(t => t.role === 'assistant');
         const lastSlots = lastAssistant?.meta?.slots || {};
 
-        // timeout wrapper for /api/chat call
-        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '20000', 10);
+        const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '12000', 10);
         const t = withTimeout(CHAT_TIMEOUT_MS);
 
         const resp = await fetch(`${baseUrl}/api/chat`, {
@@ -154,38 +136,20 @@ export default async function handler(req, res) {
           if (typeof data?.done === 'boolean') done = data.done;
           if (typeof data?.goodbye === 'string') goodbye = data.goodbye;
         } else {
-          const text = await resp?.text();
-          console.error('Chat API error:', text);
-          reply = "Thanks. I captured that. Let’s keep going.";
+          const txt = await resp?.text();
+          console.error('Chat API error:', txt);
+          reply = "Thanks. I caught that. One moment while I get the next step.";
         }
       } catch (e) {
         console.error('Chat API error:', e);
-        reply = "Thanks. I heard you. Let’s keep going.";
+        reply = "Thanks. I heard you. Give me just a moment.";
       }
 
-      // Inject empathy if caller described a problem
-      let replyForTts = looksLikeAProblem(speech) ? ensureEmpathy(reply) : reply;
-      // Normalize for TTS (H.V.A.C.)
-      replyForTts = normalizeForTTS(replyForTts);
+      await logTurn({ supabase, caller: from, callSid, text: reply, role: 'assistant', meta: { slots, done, goodbye } });
 
-      // 3) Log assistant turn WITH meta.slots
-      await logTurn({
-        supabase,
-        caller: from,
-        callSid,
-        text: replyForTts,
-        role: 'assistant',
-        meta: { slots, done, goodbye },
-      });
-
-      // 4) Build TwiML depending on whether we're finished
       if (done) {
-        const replyUrl = ttsUrlAbsolute(baseUrl, replyForTts);
-        const byeText =
-          normalizeForTTS(
-            goodbye ||
-            "Thank you. You’re all set. We look forward to helping you. Goodbye."
-          );
+        const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+        const byeText = goodbye || "Thank you. You’re all set. We look forward to helping you. Goodbye.";
         const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
 
         const twiml =
@@ -196,58 +160,84 @@ export default async function handler(req, res) {
   <Play>${byeUrl}</Play>
   <Hangup/>
 </Response>`;
-
         return sendXml(res, twiml);
       }
 
-      // Otherwise, continue the loop with 1-second pacing
-      const replyUrl = ttsUrlAbsolute(baseUrl, replyForTts);
-
+      const replyUrl = ttsUrlAbsolute(baseUrl, reply);
       const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${replyUrl}</Play>
   <Pause length="1"/>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto"/>
   <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
-
       return sendXml(res, twiml);
     } catch (err) {
       console.error('Webhook error:', err);
-
-      const fallbackUrl = ttsUrlAbsolute(
-        baseUrl,
-        normalizeForTTS('Sorry, I hit a snag. I will connect you to a teammate.')
-      );
-
+      const fallbackUrl = ttsUrlAbsolute(baseUrl, 'Sorry, I ran into a problem. I will connect you to a live agent.');
       const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${fallbackUrl}</Play>
   <Hangup/>
 </Response>`;
-
       return sendXml(res, twiml);
     }
   }
 
-  // FIRST TURN: Play Joy's intro ONCE at the start of the call.
-const intro = 'Welcome to H.V.A.C. Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
-const introUrl = ttsUrlAbsolute(baseUrl, normalizeForTTS(intro));
+  // No speech received this turn -> nudge, not the intro (unless this is the very first turn)
+  let hasHistory = false;
+  try {
+    const { count } = await supabase
+      .from('call_transcripts')
+      .select('id', { count: 'exact', head: true })
+      .eq('call_sid', callSid);
+    hasHistory = (count || 0) > 0;
+  } catch {
+    hasHistory = false;
+  }
 
-const twiml =
+  if (!hasHistory) {
+    // FIRST TURN: play the single intro
+    const intro = 'Welcome to H.V.A.C. Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+    const introUrl = ttsUrlAbsolute(baseUrl, intro);
+    const twiml =
 `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="1">
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto">
     <Play>${introUrl}</Play>
   </Gather>
   <Pause length="1"/>
   <Redirect method="POST">${actionUrl}</Redirect>
 </Response>`;
+    return sendXml(res, twiml);
+  }
 
-return sendXml(res, twiml);
+  // Later turn but silence: ask the next missing detail using last saved slots
+  let lastSlots = {};
+  try {
+    const { data } = await supabase
+      .from('call_transcripts')
+      .select('role, meta, turn_index')
+      .eq('call_sid', callSid)
+      .order('turn_index', { ascending: false })
+      .limit(5);
+    const lastAssistant = (data || []).find(r => r.role === 'assistant');
+    lastSlots = lastAssistant?.meta?.slots || {};
+  } catch {}
 
+  const nudge = nextQuestionFromSlots(lastSlots);
+  const nudgeUrl = ttsUrlAbsolute(baseUrl, nudge);
+  const twiml =
+`<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${nudgeUrl}</Play>
+  <Pause length="1"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto"/>
+  <Pause length="1"/>
+  <Redirect method="POST">${actionUrl}</Redirect>
+</Response>`;
+  return sendXml(res, twiml);
 }
-
