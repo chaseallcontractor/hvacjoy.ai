@@ -3,49 +3,50 @@
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
 const SYSTEM_PROMPT = `
-You are “Joy,” the inbound phone agent for a residential H.V.A.C. company.
+You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
-VOICE & STYLE
+Voice & Style
 - Warm, professional, concise. Short sentences (<= 14 words).
-- Always show brief empathy after the issue, then IMMEDIATELY ask the next specific question.
-- Confirm important items back to the caller as you capture them.
+- Acknowledge and comfort after the caller states a problem.
+- Confirm important items briefly after capturing them.
 
-SAFETY & GUARDRails
+Safety & Guardrails
 - Only give these prices:
   - Diagnostic visit: $50 per non-working unit.
   - Maintenance visit: $50 for non-members.
-- Never promise exact arrival times; offer a window and a call-ahead.
-- If smoke, sparks, gas smell, or health risk: advise 911 and escalate to a human.
-- Do not argue about pricing; note and escalate.
+- Never promise exact arrival times. Offer a window and a call-ahead.
+- If smoke, sparks, gas smell, or health risk: advise 911 and escalate.
+- Ask permission before any hold.
 
-CALL FLOW (capture + confirm)
-- Full name
-- Service address (line1, city, state, zip) + entry/parking notes
-- Best callback number
-- Unit count and locations
-- Brand (if known)
-- Symptoms (no cool/heat, airflow, icing, noises, ants)
-- Thermostat setpoint and current reading
-- Pricing disclosure
-- Schedule (preferred date/window & call-ahead)
-- Membership check
-- Summarize & confirm details; then close politely and end the call.
+Call Flow
+1) Greeting (only once per call):
+   "Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?"
+2) Capture + confirm:
+   - Full name
+   - Service address (line1, city, state, zip) + gate/parking notes
+   - Best callback number
+3) Problem discovery:
+   - Unit count and locations
+   - Brand (if known)
+   - Symptoms (no cool/heat, airflow, icing, noises, ants/pests)
+   - Thermostat setpoint and current reading
+4) Pricing disclosure before scheduling.
+5) Scheduling:
+   - Offer earliest availability + arrival window + call-ahead.
+6) Membership check (after booking).
+7) Confirm & summarize.
+8) Close politely.
 
-MANDATORY BEHAVIOR
-- After empathy, ALWAYS pose a clear question to capture the next missing field.
-- Do NOT re-ask questions for slots that are already non-null (see "KNOWN SLOTS").
-- When booking is confirmed and details complete, set done=true and include a short “goodbye”.
-
-OUTPUT FORMAT (one JSON object):
+Output format (single JSON):
 {
-  "reply": "<Joy's next line, voice-ready, empathy + a specific question>",
-  "slots": { ... see schema ... },
+  "reply": "<Joy's next line>",
+  "slots": { ...see schema... },
   "done": false | true,
-  "goodbye": null | "<polite closing>"
+  "goodbye": null | "<string>"
 }
 
-SLOTS SCHEMA:
+slots schema:
 {
   "full_name": null | "<string>",
   "callback_number": null | "<string>",
@@ -72,11 +73,15 @@ SLOTS SCHEMA:
   "emergency": false | true
 }
 
-DONE RULE
-- Set done=true only after: name, address (line1/city/state/zip), callback_number,
-  pricing_disclosed=true, and either preferred_date or preferred_window is set.
-- Provide a short "goodbye" (e.g., "You’re set for <window>. We’ll call ahead. Thank you. Goodbye.")
-`;
+Behavior
+- Use conversation context below. Do NOT repeat the greeting once said.
+- Do NOT ask again for any slot already non-null in "known slots".
+- Be apologetic/comforting right after the caller states a problem.
+- Set done=true only after:
+  full_name, callback_number, service_address.line1/city/state/zip,
+  pricing_disclosed=true, and (preferred_date OR preferred_window) are present.
+- Provide a warm closing when done=true.
+`.trim();
 
 function withTimeout(ms) {
   const controller = new AbortController();
@@ -88,16 +93,16 @@ async function fetchHistoryMessages(callSid) {
   if (!callSid) return [];
   try {
     const supabase = getSupabaseAdmin();
-    const { data, error } = await supabase
+    const { data } = await supabase
       .from('call_transcripts')
       .select('role, text, turn_index')
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: true })
       .limit(20);
-    if (error || !data) return [];
-    return data.map((row) => ({
-      role: row.role === 'assistant' ? 'assistant' : 'user',
-      content: row.text || ''
+
+    return (data || []).map(r => ({
+      role: r.role === 'assistant' ? 'assistant' : 'user',
+      content: r.text || ''
     }));
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
@@ -105,57 +110,82 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
+// deep merge helper for slots
+function mergeSlots(oldSlots = {}, newSlots = {}) {
+  const merged = { ...(oldSlots || {}) };
+  for (const [k, v] of Object.entries(newSlots || {})) {
+    if (v && typeof v === 'object' && !Array.isArray(v)) {
+      merged[k] = mergeSlots(merged[k] || {}, v);
+    } else if (Array.isArray(v)) {
+      merged[k] = v.length ? v : (merged[k] || []);
+    } else {
+      merged[k] = (v ?? merged[k] ?? null);
+    }
+  }
+  return merged;
+}
+
+function serverSideDoneCheck(slots) {
+  const s = slots || {};
+  const addr = s.service_address || {};
+  const basics =
+    !!s.full_name &&
+    !!s.callback_number &&
+    !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
+    s.pricing_disclosed === true &&
+    (s.preferred_date || s.preferred_window);
+
+  return basics;
+}
+
 export default async function handler(req, res) {
-  if (req.method !== "POST") {
-    res.setHeader("Allow", ["POST"]);
-    return res.status(405).json({ error: "Method Not Allowed" });
+  if (req.method !== 'POST') {
+    res.setHeader('Allow', ['POST']);
+    return res.status(405).json({ error: 'Method Not Allowed' });
   }
 
   try {
-    const { speech = "", caller = "", callSid = "", lastSlots = {} } = req.body || {};
+    const { speech = '', caller = '', callSid = '', lastSlots = {} } = req.body || {};
     if (!speech) return res.status(400).json({ error: 'Missing "speech" in body' });
 
     const apiKey = process.env.OPENAI_API_KEY;
-    if (!apiKey) return res.status(500).json({ error: "OPENAI_API_KEY is not set" });
+    if (!apiKey) return res.status(500).json({ error: 'OPENAI_API_KEY is not set' });
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Detect if greeting already happened to avoid repeats
     const greetingSaid = history.some(
-      (m) =>
-        m.role === 'assistant' &&
-        m.content.toLowerCase().includes('this call may be recorded') &&
-        m.content.toLowerCase().includes('this is joy')
+      m => m.role === 'assistant' &&
+        m.content.toLowerCase().includes('welcome to h.v.a.c joy') // our intro
     );
 
     const steering =
       (greetingSaid
-        ? "Continue the call. Do not repeat the greeting."
-        : "Start with the greeting, then proceed to capture details.") +
-      "\nKNOWN SLOTS (do not re-ask if non-null):\n" +
-      JSON.stringify(lastSlots || {}, null, 2) +
-      "\nREMINDER: Empathize briefly, then ALWAYS ask the next specific question.";
+        ? 'Continue the call. Do not repeat the greeting.'
+        : 'Start with the greeting, then begin capture.'
+      )
+      + '\nKnown slots (do not re-ask if non-null):\n'
+      + JSON.stringify(lastSlots || {}, null, 2);
 
     const messages = [
-      { role: "system", content: SYSTEM_PROMPT },
+      { role: 'system', content: SYSTEM_PROMPT },
       ...history,
-      { role: "assistant", content: steering },
-      { role: "user", content: speech }
+      { role: 'assistant', content: steering },
+      { role: 'user', content: speech }
     ];
 
     const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
     const t = withTimeout(OPENAI_TIMEOUT_MS);
 
-    const resp = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
+    const resp = await fetch('https://api.openai.com/v1/chat/completions', {
+      method: 'POST',
       headers: {
-        "Content-Type": "application/json",
+        'Content-Type': 'application/json',
         Authorization: `Bearer ${apiKey}`,
       },
       body: JSON.stringify({
-        model: "gpt-4o-mini",
+        model: 'gpt-4o-mini',
         temperature: 0.3,
-        response_format: { type: "json_object" },
+        response_format: { type: 'json_object' },
         messages,
       }),
       signal: t.signal,
@@ -164,56 +194,62 @@ export default async function handler(req, res) {
 
     if (!resp?.ok) {
       const text = await resp?.text();
-      console.error("OpenAI error", text);
+      console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: "I’m here to help. What’s the street address, city, and zip?",
-        slots: lastSlots || {},
+        reply: "Thanks. Please continue with the next detail—your street address, city, and zip.",
+        slots: lastSlots,
         done: false,
         goodbye: null,
-        model: "gpt-4o-mini",
+        model: 'gpt-4o-mini',
         usage: null,
       });
     }
 
     const data = await resp.json();
-    const raw = data?.choices?.[0]?.message?.content ?? "{}";
+    const raw = data?.choices?.[0]?.message?.content ?? '{}';
 
     let parsed;
     try { parsed = JSON.parse(raw); }
     catch {
       parsed = {
-        reply: "I’m here with you. What’s the street address, city, and zip?",
-        slots: lastSlots || {},
+        reply: "Thanks. What’s the next detail—street address, city, and zip?",
+        slots: {},
         done: false,
         goodbye: null,
       };
     }
 
-    if (typeof parsed.reply !== "string") {
-      parsed.reply = "Thanks for sharing that. What’s the next detail—street address, city, and zip?";
+    // ensure reply and slots
+    if (typeof parsed.reply !== 'string') {
+      parsed.reply = "Thanks. What’s the next detail—street address, city, and zip?";
     }
-    if (!parsed.slots || typeof parsed.slots !== "object") parsed.slots = lastSlots || {};
-    if (typeof parsed.done !== "boolean") parsed.done = false;
-    if (parsed.done && typeof parsed.goodbye !== "string") {
-      parsed.goodbye = "You’re set. We’ll call ahead. Thank you for choosing H.V.A.C. Joy. Goodbye.";
-    }
+    if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
+
+    // merge with old slots so we keep memory across turns
+    const mergedSlots = mergeSlots(lastSlots, parsed.slots);
+
+    // server-side done check (in case model forgets)
+    const done = parsed.done === true || serverSideDoneCheck(mergedSlots);
+    const goodbye = done
+      ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
+      : null;
 
     return res.status(200).json({
       reply: parsed.reply,
-      slots: parsed.slots,
-      done: parsed.done,
-      goodbye: parsed.goodbye || null,
-      model: "gpt-4o-mini",
+      slots: mergedSlots,
+      done,
+      goodbye,
+      model: 'gpt-4o-mini',
       usage: data?.usage ?? null,
     });
   } catch (err) {
-    console.error("chat handler error", err);
+    console.error('chat handler error', err);
     return res.status(200).json({
-      reply: "Sorry—please continue when ready. What’s the street address, city, and zip?",
-      slots: {},
+      reply: "I caught that. When you’re ready, please share the street address, city, and zip.",
+      slots: lastSlots || {},
       done: false,
       goodbye: null,
-      error: "Server error",
+      error: 'Server error',
       detail: err?.message ?? String(err),
     });
   }
