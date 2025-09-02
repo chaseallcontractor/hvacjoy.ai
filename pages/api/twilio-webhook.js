@@ -211,6 +211,7 @@ export default async function handler(req, res) {
     let slots = lastSlots;
     let done = false;
     let goodbye = null;
+    let needs_confirmation = false;
 
     try {
       const resp = await fetch(`${baseUrl}/api/chat`, {
@@ -227,6 +228,7 @@ export default async function handler(req, res) {
         if (data && typeof data.slots === 'object') slots = data.slots;
         if (typeof data?.done === 'boolean') done = data.done;
         if (typeof data?.goodbye === 'string') goodbye = data.goodbye;
+        if (typeof data?.needs_confirmation === 'boolean') needs_confirmation = data.needs_confirmation;
       } else {
         const text = await resp?.text();
         console.error('Chat API error:', text);
@@ -249,18 +251,32 @@ export default async function handler(req, res) {
       supabase, caller: from, callSid, text: reply, role: 'assistant', meta
     });
 
+    // Finish or keep gathering
     if (done) {
       const replyUrl = ttsUrlAbsolute(baseUrl, reply);
       const byeText = (goodbye && goodbye.trim()) ? goodbye : makeGoodbyeFromSlots(slots);
       const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
-      const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+
+      if (needs_confirmation) {
+        // Ask and wait for a final yes/correction
+        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+  <Play>${replyUrl}</Play>
+  <Pause length="1"/>
+  <Gather input="speech" action="${actionUrl}" method="POST" speechTimeout="auto" language="en-US"/>
+  <Redirect method="POST">${actionUrl}</Redirect>
+</Response>`;
+        return sendXml(res, twiml);
+      } else {
+        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${replyUrl}</Play>
   <Pause length="1"/>
   <Play>${byeUrl}</Play>
   <Hangup/>
 </Response>`;
-      return sendXml(res, twiml);
+        return sendXml(res, twiml);
+      }
     }
 
     // continue loop
