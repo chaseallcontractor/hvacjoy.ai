@@ -85,7 +85,7 @@ Behavior
 - If the caller gives a generic correction (“that’s not right / I need to change the current reading”), ask a targeted follow-up to capture the value, then update and reflect it back.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
-  pricing_disclosed=true, and (s.preferred_date OR s.preferred_window).
+  pricing_disclosed=true, and (preferred_date OR preferred_window).
 - When done is reached, ALWAYS read a short summary and ask “Is everything correct? If not, say what you’d like to change.”
 `.trim();
 
@@ -159,7 +159,7 @@ function getLastAssistantQuestion(history) {
 
 // ----------------- Parsing helpers ------------------
 function parseFullAddress(line) {
-  const m = (line || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/i);
+  const m = (line || '').match(/\b(\d{2,8}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/i);
   if (!m) return null;
   return { line1: m[1].trim(), city: m[2].trim(), state: m[3].toUpperCase(), zip: m[4] };
 }
@@ -203,7 +203,6 @@ function parseUnitCount(text) {
 }
 
 // ----------------- Corrections / Address-progress ------------------
-// If caller gives partial address, nudge for the rest (do NOT “update address to 242 …”)
 function handleAddressProgress(speech, slots) {
   const s = { ...(slots || {}) };
   const full = parseFullAddress(speech);
@@ -214,12 +213,10 @@ function handleAddressProgress(speech, slots) {
   const line1 = parseAddressLine1(speech);
   const csz = parseCityStateZip(speech);
 
-  // Street only
   if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
     s.service_address = { ...(s.service_address || {}), line1 };
     return { slots: s, reply: 'Thanks. And what are the city, state, and zip?', handled: true };
   }
-  // City/state/zip only
   if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
     s.service_address = { ...(s.service_address || {}), ...csz };
     return { slots: s, reply: 'Thanks. And what is the street address?', handled: true };
@@ -227,7 +224,6 @@ function handleAddressProgress(speech, slots) {
   return { slots: s, reply: null, handled: false };
 }
 
-// Apply explicit value corrections anywhere in the call
 function detectCorrections(speech, slots) {
   const s = { ...(slots || {}) };
   let corrected = false;
@@ -270,7 +266,6 @@ function detectCorrections(speech, slots) {
   return { slots: s, corrected, correctionSummary: notes };
 }
 
-// Handle generic corrections → create a pending_fix with a targeted follow-up
 function detectGenericCorrection(speech, slots) {
   const t = (speech || '').toLowerCase();
   const generic = /\b(not\s+right|wrong|incorrect|change|fix|update)\b/.test(t);
@@ -381,7 +376,7 @@ export default async function handler(req, res) {
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
 
-    // ---- Address progress (prevents “updated to 242 lost” & asks for rest) ----
+    // ---- Address progress (prevents premature "updated to 242 …") ----
     const addrProgress = handleAddressProgress(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
