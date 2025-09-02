@@ -73,21 +73,20 @@ slots schema:
   "pricing_disclosed": true | false,
   "emergency": false | true,
 
-  // New: guides targeted follow-ups for generic corrections
+  // For targeted follow-ups when caller says “that’s not right…”
   "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" }
 }
 
 Behavior
-- Continue the call. Do not repeat the greeting.
+- Continue the call. Do not repeat the greeting (“Welcome to H.V.A.C Joy…”).
 - Do NOT ask again for any slot already non-null in "known slots".
-- Ask for the **full address** in one question; reflect back for a quick yes/no confirm.
-- If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.
-- If the caller corrects a prior detail (e.g., “70 not 17”), acknowledge, update the detail, confirm it, and continue.
-- If the caller says a generic correction (e.g., “that’s not right” or “I need to change the current reading”), ask a targeted follow-up for the missing value, then update and reflect.
+- Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
+- If the caller corrects a prior detail (e.g., “70 not 17”), acknowledge, update, and confirm the new value.
+- If the caller gives a generic correction (“that’s not right / I need to change the current reading”), ask a targeted follow-up to capture the value, then update and reflect it back.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
-  pricing_disclosed=true, and (preferred_date OR preferred_window) are present.
-- When done is reached, ALWAYS read a short summary and ask "Is everything correct?" before finalizing.
+  pricing_disclosed=true, and (s.preferred_date OR s.preferred_window).
+- When done is reached, ALWAYS read a short summary and ask “Is everything correct? If not, say what you’d like to change.”
 `.trim();
 
 function withTimeout(ms) {
@@ -158,15 +157,15 @@ function getLastAssistantQuestion(history) {
   return null;
 }
 
-// ----------------- Corrections & parsing (works anywhere) ------------------
+// ----------------- Parsing helpers ------------------
 function parseFullAddress(line) {
-  const m = (line || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?),\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/);
+  const m = (line || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/i);
   if (!m) return null;
-  return { line1: m[1], city: m[2].trim(), state: m[3].toUpperCase(), zip: m[4] };
+  return { line1: m[1].trim(), city: m[2].trim(), state: m[3].toUpperCase(), zip: m[4] };
 }
 function parseAddressLine1(text) {
-  const m = (text || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i);
-  return m ? m[1] : null;
+  const m = (text || '').match(/\b(\d{2,8}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i);
+  return m ? m[1].trim() : null;
 }
 function parseCityStateZip(text) {
   const m = (text || '').match(/\b([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/);
@@ -203,47 +202,36 @@ function parseUnitCount(text) {
   return null;
 }
 
-// Apply value corrections immediately (no follow-up needed)
+// ----------------- Corrections / Address-progress ------------------
+// If caller gives partial address, nudge for the rest (do NOT “update address to 242 …”)
+function handleAddressProgress(speech, slots) {
+  const s = { ...(slots || {}) };
+  const full = parseFullAddress(speech);
+  if (full) {
+    s.service_address = { ...(s.service_address || {}), ...full };
+    return { slots: s, reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`, handled: true };
+  }
+  const line1 = parseAddressLine1(speech);
+  const csz = parseCityStateZip(speech);
+
+  // Street only
+  if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
+    s.service_address = { ...(s.service_address || {}), line1 };
+    return { slots: s, reply: 'Thanks. And what are the city, state, and zip?', handled: true };
+  }
+  // City/state/zip only
+  if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
+    s.service_address = { ...(s.service_address || {}), ...csz };
+    return { slots: s, reply: 'Thanks. And what is the street address?', handled: true };
+  }
+  return { slots: s, reply: null, handled: false };
+}
+
+// Apply explicit value corrections anywhere in the call
 function detectCorrections(speech, slots) {
   const s = { ...(slots || {}) };
   let corrected = false;
   const notes = [];
-
-  const full = parseFullAddress(speech);
-  if (full) {
-    s.service_address = s.service_address || {};
-    const changed = s.service_address.line1 !== full.line1
-      || s.service_address.city !== full.city
-      || s.service_address.state !== full.state
-      || s.service_address.zip !== full.zip;
-    if (changed) {
-      s.service_address = { ...s.service_address, ...full };
-      corrected = true;
-      notes.push(`service address to ${full.line1}, ${full.city}, ${full.state} ${full.zip}`);
-    }
-  }
-
-  const line1 = parseAddressLine1(speech);
-  if (line1) {
-    s.service_address = s.service_address || {};
-    if (s.service_address.line1 !== line1) {
-      s.service_address.line1 = line1;
-      corrected = true;
-      notes.push(`address to ${line1}`);
-    }
-  }
-
-  const csz = parseCityStateZip(speech);
-  if (csz) {
-    s.service_address = s.service_address || {};
-    if (s.service_address.city !== csz.city || s.service_address.state !== csz.state || s.service_address.zip !== csz.zip) {
-      s.service_address.city = csz.city;
-      s.service_address.state = csz.state;
-      s.service_address.zip = csz.zip;
-      corrected = true;
-      notes.push(`city/state/zip to ${csz.city}, ${csz.state} ${csz.zip}`);
-    }
-  }
 
   const newSp = parseThermostatSetpoint(speech);
   if (newSp !== null) {
@@ -285,12 +273,9 @@ function detectCorrections(speech, slots) {
 // Handle generic corrections → create a pending_fix with a targeted follow-up
 function detectGenericCorrection(speech, slots) {
   const t = (speech || '').toLowerCase();
-
-  // High-level “not right / change” intent
   const generic = /\b(not\s+right|wrong|incorrect|change|fix|update)\b/.test(t);
   if (!generic) return null;
 
-  // Which field?
   if (/\b(current|reading|temperature)\b/.test(t)) {
     return { field: 'thermostat.current', prompt: 'No problem. What should the current temperature be?' };
   }
@@ -306,8 +291,6 @@ function detectGenericCorrection(speech, slots) {
   if (/\b(phone|number|callback)\b/.test(t)) {
     return { field: 'callback_number', prompt: 'No problem. What is the correct callback number?' };
   }
-
-  // Fallback: ask what they’d like to correct
   return { field: 'unspecified', prompt: 'Thanks for the catch. What would you like to change?' };
 }
 
@@ -338,13 +321,13 @@ function summaryFromSlots(s) {
 function serverSideDoneCheck(slots) {
   const s = slots || {};
   const addr = s.service_address || {};
-  const basics =
+  return (
     !!s.full_name &&
     !!s.callback_number &&
     !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
     s.pricing_disclosed === true &&
-    (s.preferred_date || s.preferred_window);
-  return basics;
+    (s.preferred_date || s.preferred_window)
+  );
 }
 
 // ---- Repeat guard for time window question
@@ -395,10 +378,25 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Merge slots upfront (so pending_fix can live there)
+    // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
 
-    // 0) If a pending_fix exists, try to apply value from this turn
+    // ---- Address progress (prevents “updated to 242 lost” & asks for rest) ----
+    const addrProgress = handleAddressProgress(speech, mergedSlots);
+    if (addrProgress.handled) {
+      mergedSlots = addrProgress.slots;
+      return res.status(200).json({
+        reply: addrProgress.reply,
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
+    // ---- Pending fix flow (generic corrections) ----
     if (mergedSlots.pending_fix) {
       const pf = mergedSlots.pending_fix;
       let applied = false;
@@ -435,7 +433,6 @@ export default async function handler(req, res) {
           confirm = `Thanks — updating city, state, and zip to ${csz.city}, ${csz.state} ${csz.zip}.`;
         }
       } else if (path === 'unspecified') {
-        // Try any value correction we know
         const { slots: s2, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
         if (corrected) {
           mergedSlots = s2;
@@ -446,7 +443,6 @@ export default async function handler(req, res) {
 
       if (applied) {
         mergedSlots.pending_fix = null;
-        // Reflect and continue (don’t finish here; the main flow will do summary if at end)
         return res.status(200).json({
           reply: confirm + ' Anything else you’d like to adjust?',
           slots: mergedSlots,
@@ -457,7 +453,6 @@ export default async function handler(req, res) {
           usage: null,
         });
       } else {
-        // Still need the value — re-ask the follow-up
         const prompt = pf.prompt || 'What should it be?';
         return res.status(200).json({
           reply: prompt,
@@ -471,7 +466,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 1) Immediate value corrections (no pending_fix)
+    // ---- Explicit value corrections (no pending_fix) ----
     {
       const { slots: updatedSlots, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
       if (corrected) {
@@ -489,7 +484,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // 2) Generic corrections → create pending_fix and ask targeted follow-up
+    // ---- Generic correction detector (creates pending_fix) ----
     const pf = detectGenericCorrection(speech, mergedSlots);
     if (pf) {
       mergedSlots.pending_fix = pf;
@@ -504,13 +499,13 @@ export default async function handler(req, res) {
       });
     }
 
-    // Steering
+    // ---- Normal LLM step ---------------------------------------------------
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
 
     const steering =
       'Continue the call. Do not repeat the greeting.' +
-      '\nAsk for the FULL service address (street, city, state, zip) in one question; then reflect it back for a yes/no confirm.' +
+      '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
       '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
       (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
@@ -613,7 +608,6 @@ export default async function handler(req, res) {
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      // Always provide summary + ask for corrections
       replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
       needs_confirmation = true;
     }
