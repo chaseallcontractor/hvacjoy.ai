@@ -24,7 +24,7 @@ Call Flow
 1) Greeting (only once per call).
 2) Capture + confirm:
    - Full name
-   - Service address (line1, city, state, zip) + gate/parking notes
+   - **Full service address** (single question: street, city, state, zip). Then reflect it back for yes/no confirmation.
    - Best callback number
 3) Problem discovery:
    - Unit count and locations
@@ -43,7 +43,8 @@ Output format (single JSON):
   "reply": "<Joy's next line>",
   "slots": { ...see schema... },
   "done": false | true,
-  "goodbye": null | "<string>"
+  "goodbye": null | "<string>",
+  "needs_confirmation": false | true
 }
 
 slots schema:
@@ -76,12 +77,14 @@ slots schema:
 Behavior
 - Continue the call. Do not repeat the greeting.
 - Do NOT ask again for any slot already non-null in "known slots".
+- Ask for the **full address** in one question; reflect back for a quick yes/no confirm.
 - If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.
-- Be apologetic/comforting right after the caller states a problem.
+- If the caller corrects a prior detail (e.g., “70 not 17”), acknowledge, update the detail, confirm it, and continue.
+- If the caller says “we already talked about this,” skip repeating covered steps and continue forward.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
   pricing_disclosed=true, and (preferred_date OR preferred_window) are present.
-- Provide a warm closing when done=true.
+- When done is reached, ALWAYS read a short summary and ask "Is everything correct?" before finalizing.
 `.trim();
 
 function withTimeout(ms) {
@@ -96,10 +99,10 @@ async function fetchHistoryMessages(callSid) {
     const supabase = getSupabaseAdmin();
     const { data } = await supabase
       .from('call_transcripts')
-      .select('role, text, turn_index') // meta not needed to render for the model
+      .select('role, text, turn_index')
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: true })
-      .limit(40);
+      .limit(50);
 
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
@@ -111,7 +114,6 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
-// deep merge helper for slots
 function mergeSlots(oldSlots = {}, newSlots = {}) {
   const merged = { ...(oldSlots || {}) };
   for (const [k, v] of Object.entries(newSlots || {})) {
@@ -126,28 +128,24 @@ function mergeSlots(oldSlots = {}, newSlots = {}) {
   return merged;
 }
 
-// ---------- Heuristics to cover model/STT misses ---------------------------
+// ---------- Heuristics -----------------------------------------------------
 function inferPreferredWindowFrom(text) {
   const t = (text || '').toLowerCase();
   if (/\bmorning\b/.test(t)) return 'morning';
   if (/\bafternoon\b/.test(t)) return 'afternoon';
-  if (/\bevening\b/.test(t)) return 'afternoon'; // treat evening as PM window
+  if (/\bevening\b/.test(t)) return 'afternoon';
   return null;
 }
-
 function statementMentionsPricing(text) {
   const t = (text || '').toLowerCase();
   return /\bdiagnostic\b/.test(t) && /(?:\$|usd\s*)?50\b/.test(t);
 }
-
 function inferYesNoCallAhead(text) {
   const t = (text || '').toLowerCase();
   if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay)\b/.test(t)) return true;
   if (/\b(no|nope|nah|don’t|do not|no thanks|not necessary)\b/.test(t)) return false;
   return null;
 }
-
-// Find the last assistant question in history (ends with "?")
 function getLastAssistantQuestion(history) {
   const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
   for (let i = assistantLines.length - 1; i >= 0; i--) {
@@ -157,29 +155,136 @@ function getLastAssistantQuestion(history) {
   return null;
 }
 
-function applyHeuristics(mergedSlots, history, latestUser, latestAssistant) {
-  const slots = { ...(mergedSlots || {}) };
-
-  if (!slots.preferred_window) {
-    const win = inferPreferredWindowFrom(latestUser);
-    if (win) slots.preferred_window = win;
+// ----------------- Corrections & parsing (works anywhere) ------------------
+function parseFullAddress(line) {
+  const m = (line || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?),\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/);
+  if (!m) return null;
+  return { line1: m[1], city: m[2].trim(), state: m[3].toUpperCase(), zip: m[4] };
+}
+function parseAddressLine1(text) {
+  const m = (text || '').match(/\b(\d{3,6}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i);
+  return m ? m[1] : null;
+}
+function parseCityStateZip(text) {
+  const m = (text || '').match(/\b([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/);
+  if (m) return { city: m[1].trim(), state: m[2].toUpperCase(), zip: m[3] };
+  return null;
+}
+function parseThermostatSetpointCorrection(text) {
+  const t = (text || '').toLowerCase();
+  const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
+  if (twoNums) {
+    const a = parseInt(twoNums[1], 10);
+    const b = parseInt(twoNums[2], 10);
+    if (!Number.isNaN(a) && !Number.isNaN(b)) return Math.max(a, b);
   }
+  const direct = t.match(/\b(set\s*point|setpoint|thermostat)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
+  if (direct) {
+    const val = parseInt(direct[3], 10);
+    if (!Number.isNaN(val)) return val;
+  }
+  return null;
+}
+function parsePhoneCorrection(text) {
+  const digits = (text || '').replace(/\D+/g, '');
+  if (digits.length === 10) return `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`;
+  return null;
+}
+function parseUnitCount(text) {
+  const m = (text || '').match(/\b(\d+)\s*(?:unit|units|ac|systems?)\b/i);
+  if (m) return parseInt(m[1], 10);
+  return null;
+}
+function detectCorrections(speech, slots) {
+  const s = { ...(slots || {}) };
+  let corrected = false;
+  const notes = [];
 
-  if (slots.pricing_disclosed !== true) {
-    const lastAssistantLines = [...history, { role: 'assistant', content: latestAssistant || '' }]
-      .filter(m => m.role === 'assistant')
-      .slice(-8)
-      .map(m => m.content || '');
-    if (lastAssistantLines.some(statementMentionsPricing)) {
-      slots.pricing_disclosed = true;
+  const full = parseFullAddress(speech);
+  if (full) {
+    s.service_address = s.service_address || {};
+    const changed = s.service_address.line1 !== full.line1
+      || s.service_address.city !== full.city
+      || s.service_address.state !== full.state
+      || s.service_address.zip !== full.zip;
+    if (changed) {
+      s.service_address = { ...s.service_address, ...full };
+      corrected = true;
+      notes.push(`service address to ${full.line1}, ${full.city}, ${full.state} ${full.zip}`);
     }
   }
 
-  // Infer/overwrite call_ahead from latest utterance (latest wins)
-  const inferred = inferYesNoCallAhead(latestUser);
-  if (inferred !== null) slots.call_ahead = inferred;
+  const line1 = parseAddressLine1(speech);
+  if (line1) {
+    s.service_address = s.service_address || {};
+    if (s.service_address.line1 !== line1) {
+      s.service_address.line1 = line1;
+      corrected = true;
+      notes.push(`address to ${line1}`);
+    }
+  }
 
-  return slots;
+  const csz = parseCityStateZip(speech);
+  if (csz) {
+    s.service_address = s.service_address || {};
+    if (s.service_address.city !== csz.city || s.service_address.state !== csz.state || s.service_address.zip !== csz.zip) {
+      s.service_address.city = csz.city;
+      s.service_address.state = csz.state;
+      s.service_address.zip = csz.zip;
+      corrected = true;
+      notes.push(`city/state/zip to ${csz.city}, ${csz.state} ${csz.zip}`);
+    }
+  }
+
+  const newSp = parseThermostatSetpointCorrection(speech);
+  if (newSp !== null) {
+    s.thermostat = s.thermostat || {};
+    if (s.thermostat.setpoint !== newSp) {
+      s.thermostat.setpoint = newSp;
+      corrected = true;
+      notes.push(`thermostat setpoint to ${newSp}°`);
+    }
+  }
+
+  const phone = parsePhoneCorrection(speech);
+  if (phone && s.callback_number !== phone) {
+    s.callback_number = phone;
+    corrected = true;
+    notes.push(`callback number to ${phone}`);
+  }
+
+  const uc = parseUnitCount(speech);
+  if (uc !== null && s.unit_count !== uc) {
+    s.unit_count = uc;
+    corrected = true;
+    notes.push(`unit count to ${uc}`);
+  }
+
+  return { slots: s, corrected, correctionSummary: notes };
+}
+
+// Summary helper
+function summaryFromSlots(s) {
+  const name = s.full_name || 'Unknown';
+  const addr = s.service_address || {};
+  const addrLine = [addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ');
+  const units = s.unit_count != null ? `${s.unit_count}` : 'Unknown';
+  const locs = s.unit_locations ? `, ${s.unit_locations}` : '';
+  const brand = s.brand ? s.brand : 'Unknown';
+  const thermo = s.thermostat || {};
+  const sp = thermo.setpoint != null ? thermo.setpoint : 'Unknown';
+  const cur = thermo.current != null ? thermo.current : 'Unknown';
+  const window = s.preferred_window ? s.preferred_window : (s.preferred_date ? '' : 'unspecified');
+  const date = s.preferred_date ? s.preferred_date : '';
+  const callAhead = (s.call_ahead === false) ? 'No call-ahead' : 'Call-ahead';
+  return `- Name: ${name}
+- Address: ${addrLine}
+- AC units: ${units}${locs}
+- Brand: ${brand}
+- Thermostat setpoint: ${sp}, current: ${cur}
+- Appointment: ${date || 'scheduled'}${window ? ` (${window})` : ''}
+- ${callAhead}
+- Diagnostic fee: $50.`;
 }
 
 function serverSideDoneCheck(slots) {
@@ -192,6 +297,21 @@ function serverSideDoneCheck(slots) {
     s.pricing_disclosed === true &&
     (s.preferred_date || s.preferred_window);
   return basics;
+}
+
+// ---- Repeat guard for time window question
+function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
+  if (!lastQ || !newQ) return { newReply: null, updated: false };
+  if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
+  const win = inferPreferredWindowFrom(speech);
+  if (win && !mergedSlots.preferred_window) {
+    mergedSlots.preferred_window = win;
+    return {
+      newReply: `Got it — we'll reserve the ${win} window. Do you prefer tomorrow, or another date?`,
+      updated: true
+    };
+  }
+  return { newReply: null, updated: false };
 }
 
 export default async function handler(req, res) {
@@ -209,16 +329,36 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Always steer to continue (intro is handled/logged by webhook)
+    // Early corrections (work anywhere)
+    let mergedSlots = { ...(lastSlots || {}) };
+    {
+      const { slots: updatedSlots, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
+      if (corrected) {
+        mergedSlots = updatedSlots;
+        const msg = `Thanks for the clarification. I've updated ${correctionSummary.join(', ')}. Let's continue.`;
+        return res.status(200).json({
+          reply: msg,
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+    }
+
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
 
     const steering =
       'Continue the call. Do not repeat the greeting.' +
+      '\nAsk for the FULL service address (street, city, state, zip) in one question; then reflect it back for a yes/no confirm.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
+      '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
       (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
       '\nKnown slots (do not re-ask if non-null):\n' +
-      JSON.stringify(lastSlots || {}, null, 2);
+      JSON.stringify(mergedSlots || {}, null, 2);
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
@@ -250,10 +390,11 @@ export default async function handler(req, res) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: "Thanks. Please continue with the next detail—your street address, city, and zip.",
-        slots: lastSlots,
+        reply: "Thanks. Please share the full service address, including city, state, and zip.",
+        slots: mergedSlots,
         done: false,
         goodbye: null,
+        needs_confirmation: false,
         model: 'gpt-4o-mini',
         usage: null,
       });
@@ -266,46 +407,77 @@ export default async function handler(req, res) {
     try { parsed = JSON.parse(raw); }
     catch {
       parsed = {
-        reply: "Thanks. What’s the next detail—street address, city, and zip?",
+        reply: "Thanks. What’s the next detail—your full service address with city, state, and zip?",
         slots: {},
         done: false,
         goodbye: null,
+        needs_confirmation: false,
       };
     }
 
-    // ensure reply and slots
     if (typeof parsed.reply !== 'string') {
-      parsed.reply = "Thanks. What’s the next detail—street address, city, and zip?";
+      parsed.reply = "Thanks. What’s the next detail—your full service address with city, state, and zip?";
     }
     if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
     // merge with old slots
-    let mergedSlots = mergeSlots(lastSlots, parsed.slots);
+    mergedSlots = mergeSlots(mergedSlots, parsed.slots);
 
     // heuristics
-    mergedSlots = applyHeuristics(mergedSlots, history, speech, parsed.reply);
+    if (!mergedSlots.preferred_window) {
+      const win = inferPreferredWindowFrom(speech);
+      if (win) mergedSlots.preferred_window = win;
+    }
+    if (mergedSlots.pricing_disclosed !== true) {
+      const lastAssistantLines = [...history, { role: 'assistant', content: parsed.reply || '' }]
+        .filter(m => m.role === 'assistant')
+        .slice(-8)
+        .map(m => m.content || '');
+      if (lastAssistantLines.some(statementMentionsPricing)) {
+        mergedSlots.pricing_disclosed = true;
+      }
+    }
+    {
+      const inferred = inferYesNoCallAhead(speech);
+      if (inferred !== null) mergedSlots.call_ahead = inferred;
+    }
+
+    // Time-window repeat guard
+    const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
+    if (guard.updated) parsed.reply = guard.newReply;
 
     // done?
-    const done = parsed.done === true || serverSideDoneCheck(mergedSlots);
-    const goodbye = done
-      ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
-      : null;
+    const serverDone = serverSideDoneCheck(mergedSlots);
+
+    // Always provide our summary + confirmation when done
+    let needs_confirmation = false;
+    let replyOut = parsed.reply;
+    if (serverDone) {
+      const { slots: correctedSlots, corrected } = detectCorrections(speech, mergedSlots);
+      mergedSlots = correctedSlots;
+      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct?";
+      needs_confirmation = true;
+    }
 
     return res.status(200).json({
-      reply: parsed.reply,
+      reply: serverDone ? replyOut : parsed.reply,
       slots: mergedSlots,
-      done,
-      goodbye,
+      done: serverDone && !needs_confirmation,
+      goodbye: serverDone && !needs_confirmation
+        ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
+        : null,
+      needs_confirmation,
       model: 'gpt-4o-mini',
       usage: data?.usage ?? null,
     });
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply: "I caught that. When you’re ready, please share the street address, city, and zip.",
+      reply: "I caught that. When you’re ready, please share the full service address, including city, state, and zip.",
       slots: lastSlots || {},
       done: false,
       goodbye: null,
+      needs_confirmation: false,
       error: 'Server error',
       detail: err?.message ?? String(err),
     });
