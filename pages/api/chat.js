@@ -8,9 +8,9 @@ Primary goal: warmly book service, set expectations, and capture complete job de
 
 Voice & Style
 - Warm, professional, concise. Short sentences (<= 14 words).
-- Acknowledge and comfort after the caller states a problem.
+- When a caller reports a problem or discomfort, briefly acknowledge and comfort.
 - Confirm important items briefly after capturing them.
-- Do not use meta language (e.g., “I already answered your questions”). Be forward-looking and helpful.
+- Avoid meta talk (“we already did this”). Be forward-looking and helpful.
 
 Safety & Guardrails
 - Only give these prices:
@@ -71,7 +71,10 @@ slots schema:
   "call_ahead": null | true | false,
   "hazards_pets_ants_notes": null | "<string>",
   "pricing_disclosed": true | false,
-  "emergency": false | true
+  "emergency": false | true,
+
+  // New: guides targeted follow-ups for generic corrections
+  "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" }
 }
 
 Behavior
@@ -80,7 +83,7 @@ Behavior
 - Ask for the **full address** in one question; reflect back for a quick yes/no confirm.
 - If the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.
 - If the caller corrects a prior detail (e.g., “70 not 17”), acknowledge, update the detail, confirm it, and continue.
-- If the caller says “we already talked about this,” skip repeating covered steps and continue forward.
+- If the caller says a generic correction (e.g., “that’s not right” or “I need to change the current reading”), ask a targeted follow-up for the missing value, then update and reflect.
 - Set done=true only after:
   full_name, callback_number, service_address.line1/city/state/zip,
   pricing_disclosed=true, and (preferred_date OR preferred_window) are present.
@@ -170,7 +173,7 @@ function parseCityStateZip(text) {
   if (m) return { city: m[1].trim(), state: m[2].toUpperCase(), zip: m[3] };
   return null;
 }
-function parseThermostatSetpointCorrection(text) {
+function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
   const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
   if (twoNums) {
@@ -185,7 +188,11 @@ function parseThermostatSetpointCorrection(text) {
   }
   return null;
 }
-function parsePhoneCorrection(text) {
+function parseThermostatCurrent(text) {
+  const m = (text || '').match(/\b(?:current|now|reading)\b[^0-9]*?(\d{1,3})\b/i);
+  return m ? parseInt(m[1], 10) : null;
+}
+function parsePhone(text) {
   const digits = (text || '').replace(/\D+/g, '');
   if (digits.length === 10) return `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`;
   return null;
@@ -195,6 +202,8 @@ function parseUnitCount(text) {
   if (m) return parseInt(m[1], 10);
   return null;
 }
+
+// Apply value corrections immediately (no follow-up needed)
 function detectCorrections(speech, slots) {
   const s = { ...(slots || {}) };
   let corrected = false;
@@ -236,7 +245,7 @@ function detectCorrections(speech, slots) {
     }
   }
 
-  const newSp = parseThermostatSetpointCorrection(speech);
+  const newSp = parseThermostatSetpoint(speech);
   if (newSp !== null) {
     s.thermostat = s.thermostat || {};
     if (s.thermostat.setpoint !== newSp) {
@@ -246,7 +255,17 @@ function detectCorrections(speech, slots) {
     }
   }
 
-  const phone = parsePhoneCorrection(speech);
+  const newCur = parseThermostatCurrent(speech);
+  if (newCur !== null) {
+    s.thermostat = s.thermostat || {};
+    if (s.thermostat.current !== newCur) {
+      s.thermostat.current = newCur;
+      corrected = true;
+      notes.push(`current temperature to ${newCur}°`);
+    }
+  }
+
+  const phone = parsePhone(speech);
   if (phone && s.callback_number !== phone) {
     s.callback_number = phone;
     corrected = true;
@@ -261,6 +280,35 @@ function detectCorrections(speech, slots) {
   }
 
   return { slots: s, corrected, correctionSummary: notes };
+}
+
+// Handle generic corrections → create a pending_fix with a targeted follow-up
+function detectGenericCorrection(speech, slots) {
+  const t = (speech || '').toLowerCase();
+
+  // High-level “not right / change” intent
+  const generic = /\b(not\s+right|wrong|incorrect|change|fix|update)\b/.test(t);
+  if (!generic) return null;
+
+  // Which field?
+  if (/\b(current|reading|temperature)\b/.test(t)) {
+    return { field: 'thermostat.current', prompt: 'No problem. What should the current temperature be?' };
+  }
+  if (/\b(set\s*point|setpoint|thermostat)\b/.test(t)) {
+    return { field: 'thermostat.setpoint', prompt: 'Got it. What should the thermostat setpoint be?' };
+  }
+  if (/\b(address|street)\b/.test(t)) {
+    return { field: 'service_address.line1', prompt: 'Okay. What is the correct street address?' };
+  }
+  if (/\b(city|state|zip)\b/.test(t)) {
+    return { field: 'service_address.city_state_zip', prompt: 'Sure. Please say the city, state, and zip.' };
+  }
+  if (/\b(phone|number|callback)\b/.test(t)) {
+    return { field: 'callback_number', prompt: 'No problem. What is the correct callback number?' };
+  }
+
+  // Fallback: ask what they’d like to correct
+  return { field: 'unspecified', prompt: 'Thanks for the catch. What would you like to change?' };
 }
 
 // Summary helper
@@ -314,6 +362,24 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   return { newReply: null, updated: false };
 }
 
+// Suppress pricing repeats after it’s been disclosed
+function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
+  if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
+    return 'Great—thanks for confirming. Let’s schedule your visit.';
+  }
+  return reply;
+}
+
+// Light empathy if caller mentions hot/no cool and reply lacks it
+function addEmpathy(speech, reply) {
+  const t = (speech || '').toLowerCase();
+  const problem = /\b(no (cool|cold|heat)|blowing hot|very hot|not blowing cold|unit.*down|not working)\b/.test(t);
+  if (problem && !/sorry|understand|apologize/i.test(reply)) {
+    return `I’m sorry to hear that. ${reply}`;
+  }
+  return reply;
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -329,8 +395,83 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
-    // Early corrections (work anywhere)
+    // Merge slots upfront (so pending_fix can live there)
     let mergedSlots = { ...(lastSlots || {}) };
+
+    // 0) If a pending_fix exists, try to apply value from this turn
+    if (mergedSlots.pending_fix) {
+      const pf = mergedSlots.pending_fix;
+      let applied = false;
+      let confirm = '';
+
+      const path = pf.field || '';
+      const setThermo = (key, val) => {
+        mergedSlots.thermostat = mergedSlots.thermostat || {};
+        mergedSlots.thermostat[key] = val;
+        applied = true;
+        confirm = `Okay — updating the ${key === 'current' ? 'current temperature' : 'thermostat setpoint'} to ${val}°.`;
+      };
+
+      if (path === 'thermostat.current') {
+        const val = parseThermostatCurrent(speech);
+        if (val !== null) setThermo('current', val);
+      } else if (path === 'thermostat.setpoint') {
+        const val = parseThermostatSetpoint(speech);
+        if (val !== null) setThermo('setpoint', val);
+      } else if (path === 'callback_number') {
+        const phone = parsePhone(speech);
+        if (phone) { mergedSlots.callback_number = phone; applied = true; confirm = `Got it — updating the callback number to ${phone}.`; }
+      } else if (path === 'service_address.line1') {
+        const line1 = parseAddressLine1(speech);
+        if (line1) { mergedSlots.service_address = mergedSlots.service_address || {}; mergedSlots.service_address.line1 = line1; applied = true; confirm = `Thanks — updating the street address to ${line1}.`; }
+      } else if (path === 'service_address.city_state_zip') {
+        const csz = parseCityStateZip(speech) || parseFullAddress(speech);
+        if (csz) {
+          mergedSlots.service_address = mergedSlots.service_address || {};
+          mergedSlots.service_address.city = csz.city;
+          mergedSlots.service_address.state = csz.state;
+          mergedSlots.service_address.zip = csz.zip;
+          applied = true;
+          confirm = `Thanks — updating city, state, and zip to ${csz.city}, ${csz.state} ${csz.zip}.`;
+        }
+      } else if (path === 'unspecified') {
+        // Try any value correction we know
+        const { slots: s2, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
+        if (corrected) {
+          mergedSlots = s2;
+          applied = true;
+          confirm = `Thanks — I've updated ${correctionSummary.join(', ')}.`;
+        }
+      }
+
+      if (applied) {
+        mergedSlots.pending_fix = null;
+        // Reflect and continue (don’t finish here; the main flow will do summary if at end)
+        return res.status(200).json({
+          reply: confirm + ' Anything else you’d like to adjust?',
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      } else {
+        // Still need the value — re-ask the follow-up
+        const prompt = pf.prompt || 'What should it be?';
+        return res.status(200).json({
+          reply: prompt,
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+    }
+
+    // 1) Immediate value corrections (no pending_fix)
     {
       const { slots: updatedSlots, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
       if (corrected) {
@@ -348,6 +489,22 @@ export default async function handler(req, res) {
       }
     }
 
+    // 2) Generic corrections → create pending_fix and ask targeted follow-up
+    const pf = detectGenericCorrection(speech, mergedSlots);
+    if (pf) {
+      mergedSlots.pending_fix = pf;
+      return res.status(200).json({
+        reply: pf.prompt,
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
+    // Steering
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
 
@@ -446,16 +603,18 @@ export default async function handler(req, res) {
     const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
 
+    // Suppress pricing repeats; add empathy if needed
+    parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
+    parsed.reply = addEmpathy(speech, parsed.reply);
+
     // done?
     const serverDone = serverSideDoneCheck(mergedSlots);
 
-    // Always provide our summary + confirmation when done
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      const { slots: correctedSlots, corrected } = detectCorrections(speech, mergedSlots);
-      mergedSlots = correctedSlots;
-      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct?";
+      // Always provide summary + ask for corrections
+      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
       needs_confirmation = true;
     }
 
