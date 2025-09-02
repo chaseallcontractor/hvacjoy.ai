@@ -74,7 +74,10 @@ slots schema:
   "emergency": false | true,
 
   // For targeted follow-ups when caller says “that’s not right…”
-  "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" }
+  "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" },
+
+  // Final “yes/no summary” state
+  "confirmation_pending": null | true | false
 }
 
 Behavior
@@ -104,11 +107,11 @@ async function fetchHistoryMessages(callSid) {
       .select('role, text, turn_index')
       .eq('call_sid', callSid)
       .order('turn_index', { ascending: true })
-      .limit(50);
+      .limit(60);
 
-    return (data || []).map((r) => ({
+    return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
-      content: r.text || '',
+      content: r.text || ''
     }));
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
@@ -123,9 +126,9 @@ function mergeSlots(oldSlots = {}, newSlots = {}) {
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       merged[k] = mergeSlots(merged[k] || {}, v);
     } else if (Array.isArray(v)) {
-      merged[k] = v.length ? v : merged[k] || [];
+      merged[k] = v.length ? v : (merged[k] || []);
     } else {
-      merged[k] = v ?? merged[k] ?? null;
+      merged[k] = (v ?? merged[k] ?? null);
     }
   }
   return merged;
@@ -145,12 +148,12 @@ function statementMentionsPricing(text) {
 }
 function inferYesNoCallAhead(text) {
   const t = (text || '').toLowerCase();
-  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay)\b/.test(t)) return true;
+  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay|yeah)\b/.test(t)) return true;
   if (/\b(no|nope|nah|don’t|do not|no thanks|not necessary)\b/.test(t)) return false;
   return null;
 }
 function getLastAssistantQuestion(history) {
-  const assistantLines = (history || []).filter((m) => m.role === 'assistant').map((m) => m.content);
+  const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
   for (let i = assistantLines.length - 1; i >= 0; i--) {
     const line = (assistantLines[i] || '').trim();
     if (line.endsWith('?')) return line;
@@ -174,12 +177,10 @@ function normState(s) {
   if (!s) return null;
   const up = s.trim().toUpperCase();
   if (/^[A-Z]{2}$/.test(up)) return up;
-  const abbr = STATE_MAP[(s || '').toLowerCase()];
+  const abbr = STATE_MAP[(s||'').toLowerCase()];
   return abbr || null;
 }
-
 function parseFullAddress(line) {
-  // allow commas in street and full state names; support ZIP+4
   const m = (line || '').match(
     /\b(\d{2,8}\s+[A-Za-z0-9.\s,]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/i
   );
@@ -189,7 +190,7 @@ function parseFullAddress(line) {
     line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
     city: m[2].trim(),
     state: state || m[3].trim().toUpperCase(),
-    zip: m[4],
+    zip: m[4]
   };
 }
 function parseAddressLine1(text) {
@@ -206,15 +207,13 @@ function parseCityStateZip(text) {
 }
 function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
-  const twoNums =
-    t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) ||
-    t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
+  const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
   if (twoNums) {
     const a = parseInt(twoNums[1], 10);
     const b = parseInt(twoNums[2], 10);
     if (!Number.isNaN(a) && !Number.isNaN(b)) return Math.max(a, b);
   }
-  const direct = t.match(/\b(set\s*point|setpoint|thermostat)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
+  const direct = t.match(/\b(set\s*point|setpoint|thermostat|set\s*point)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
   if (direct) {
     const val = parseInt(direct[3], 10);
     if (!Number.isNaN(val)) return val;
@@ -240,118 +239,84 @@ function parseUnitCount(text) {
   return null;
 }
 
-// ----------------- Corrections / Address-progress ------------------
-function handleAddressProgress(speech, slots) {
-  const s = { ...(slots || {}) };
-
-  // if we already have full address, don't ask again
-  const haveAll =
-    s.service_address &&
-    s.service_address.line1 &&
-    s.service_address.city &&
-    s.service_address.state &&
-    s.service_address.zip;
-  if (haveAll) return { slots: s, reply: null, handled: false };
-
-  const full = parseFullAddress(speech);
-  if (full) {
-    s.service_address = { ...(s.service_address || {}), ...full };
-    return {
-      slots: s,
-      reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
-      handled: true,
-    };
+// ----------------- Helpers to steer/clean replies ------------------
+function wantsToContinue(text='') {
+  return /\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(text || '');
+}
+function enforceHVACBranding(text='') {
+  if (!text) return text;
+  let out = text.replace(/\bH\s*V\s*A\s*C\b/gi, 'H.V.A.C');
+  out = out.replace(/\bH\.?V\.?A\.?C\.?\s+Joy\b/gi, 'H.V.A.C Joy');
+  return out;
+}
+function stripRepeatedGreeting(history, reply) {
+  const seenGreeting = (history || []).some(m => /welcome to h\.?v\.?a\.?c\.?\s+joy/i.test(m.content || ''));
+  if (!seenGreeting) return reply;
+  return reply.replace(/^\s*welcome to h\.?v\.?a\.?c\.?\s+joy.*?(?:\.\s*|\s*$)/i, '').trim();
+}
+function suppressMembershipUntilBooked(reply, slots) {
+  const booked = !!(slots.preferred_window || slots.preferred_date);
+  if (!booked && /member|maintenance program/i.test(reply)) {
+    return 'Great—thanks. Let’s finish your booking first.';
   }
-  const line1 = parseAddressLine1(speech);
-  const csz = parseCityStateZip(speech);
-
-  if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
-    s.service_address = { ...(s.service_address || {}), line1 };
-    return {
-      slots: s,
-      reply: 'Thanks. And what are the city, state, and zip?',
-      handled: true,
-    };
+  return reply;
+}
+function nextMissingPrompt(s) {
+  const addr = s.service_address || {};
+  if (!s.full_name) return 'Can I have your full name?';
+  if (!s.callback_number) return 'Great. What’s the best callback number?';
+  if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
+    if (!addr.line1) return 'What is the street address?';
+    return 'And the city, state, and zip?';
   }
-  if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
-    s.service_address = { ...(s.service_address || {}), ...csz };
-    return { slots: s, reply: 'Thanks. And what is the street address?', handled: true };
+  if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
+  if (!((s.thermostat||{}).setpoint != null && (s.thermostat||{}).current != null)) {
+    return 'What is the thermostat setpoint and the current reading?';
   }
-  return { slots: s, reply: null, handled: false };
+  if (s.pricing_disclosed !== true) return 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
+  if (!(s.preferred_date || s.preferred_window)) return 'What time window works for you—morning or afternoon?';
+  return null;
 }
 
-function detectCorrections(speech, slots) {
-  const s = { ...(slots || {}) };
-  let corrected = false;
-  const notes = [];
-
-  const newSp = parseThermostatSetpoint(speech);
-  if (newSp !== null) {
-    s.thermostat = s.thermostat || {};
-    if (s.thermostat.setpoint !== newSp) {
-      s.thermostat.setpoint = newSp;
-      corrected = true;
-      notes.push(`thermostat setpoint to ${newSp}°`);
-    }
+// ---- Repeat guard for time window question
+function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
+  if (!lastQ || !newQ) return { newReply: null, updated: false };
+  if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
+  const win = inferPreferredWindowFrom(speech);
+  if (win && !mergedSlots.preferred_window) {
+    mergedSlots.preferred_window = win;
+    return {
+      newReply: `Got it — we'll reserve the ${win} window. Do you prefer tomorrow, or another date?`,
+      updated: true
+    };
   }
-
-  const newCur = parseThermostatCurrent(speech);
-  if (newCur !== null) {
-    s.thermostat = s.thermostat || {};
-    if (s.thermostat.current !== newCur) {
-      s.thermostat.current = newCur;
-      corrected = true;
-      notes.push(`current temperature to ${newCur}°`);
-    }
-  }
-
-  const phone = parsePhone(speech);
-  if (phone) {
-    if (phone.complete) {
-      if (s.callback_number !== phone.full) {
-        s.callback_number = phone.full;
-        corrected = true;
-        notes.push(`callback number to ${phone.full}`);
-      }
-    } else {
-      s.pending_fix = {
-        field: 'callback_number',
-        prompt: 'Could you give me the full 10-digit callback number?',
-      };
-    }
-  }
-
-  const uc = parseUnitCount(speech);
-  if (uc !== null && s.unit_count !== uc) {
-    s.unit_count = uc;
-    corrected = true;
-    notes.push(`unit count to ${uc}`);
-  }
-
-  return { slots: s, corrected, correctionSummary: notes };
+  return { newReply: null, updated: false };
 }
 
-function detectGenericCorrection(speech, slots) {
+// Suppress pricing repeats after it’s been disclosed
+function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
+  if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
+    return 'Great—thanks for confirming. Let’s schedule your visit.';
+  }
+  return reply;
+}
+
+// Light empathy if caller mentions hot/no cool and reply lacks it
+function addEmpathy(speech, reply) {
   const t = (speech || '').toLowerCase();
-  const generic = /\b(not\s+right|wrong|incorrect|change|fix|update)\b/.test(t);
-  if (!generic) return null;
+  const problem = /\b(no (cool|cold|heat)|blowing hot|very hot|not blowing cold|unit.*down|not working)\b/.test(t);
+  if (problem && !/sorry|understand|apologize/i.test(reply)) {
+    return `I’m sorry to hear that. ${reply}`;
+  }
+  return reply;
+}
 
-  if (/\b(current|reading|temperature)\b/.test(t)) {
-    return { field: 'thermostat.current', prompt: 'No problem. What should the current temperature be?' };
-  }
-  if (/\b(set\s*point|setpoint|thermostat)\b/.test(t)) {
-    return { field: 'thermostat.setpoint', prompt: 'Got it. What should the thermostat setpoint be?' };
-  }
-  if (/\b(address|street)\b/.test(t)) {
-    return { field: 'service_address.line1', prompt: 'Okay. What is the correct street address?' };
-  }
-  if (/\b(city|state|zip)\b/.test(t)) {
-    return { field: 'service_address.city_state_zip', prompt: 'Sure. Please say the city, state, and zip.' };
-  }
-  if (/\b(phone|number|callback)\b/.test(t)) {
-    return { field: 'callback_number', prompt: 'No problem. What is the correct callback number?' };
-  }
-  return { field: 'unspecified', prompt: 'Thanks for the catch. What would you like to change?' };
+// quick yes/no helpers for confirmation gate
+function isAffirmation(text='') {
+  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
+}
+function isNegation(text='') {
+  return /\b(no|nope|nah|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
 }
 
 // Summary helper
@@ -388,47 +353,6 @@ function serverSideDoneCheck(slots) {
     s.pricing_disclosed === true &&
     (s.preferred_date || s.preferred_window)
   );
-}
-
-// ---- Repeat guard for time window question
-function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
-  if (!lastQ || !newQ) return { newReply: null, updated: false };
-  if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
-  const win = inferPreferredWindowFrom(speech);
-  if (win && !mergedSlots.preferred_window) {
-    mergedSlots.preferred_window = win;
-    return {
-      newReply: `Got it — we'll reserve the ${win} window. Do you prefer tomorrow, or another date?`,
-      updated: true,
-    };
-  }
-  return { newReply: null, updated: false };
-}
-
-// Suppress pricing repeats after it’s been disclosed
-function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
-  if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
-    return 'Great—thanks for confirming. Let’s schedule your visit.';
-  }
-  return reply;
-}
-
-// Light empathy if caller mentions hot/no cool and reply lacks it
-function addEmpathy(speech, reply) {
-  const t = (speech || '').toLowerCase();
-  const problem = /\b(no (cool|cold|heat)|blowing hot|very hot|not blowing cold|unit.*down|not working)\b/.test(t);
-  if (problem && !/sorry|understand|apologize/i.test(reply)) {
-    return `I’m sorry to hear that. ${reply}`;
-  }
-  return reply;
-}
-
-// quick yes/no helpers for confirmation gate
-function isAffirmation(text = '') {
-  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
-}
-function isNegation(text = '') {
-  return /\b(no|nope|nah|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
 }
 
 export default async function handler(req, res) {
@@ -468,11 +392,44 @@ export default async function handler(req, res) {
     }
 
     // ---- Address progress (prevents premature re-asks) ----
-    const addrProgress = handleAddressProgress(speech, mergedSlots);
+    const addrProgress = (function handleAddressProgress(speech, slots) {
+      const s = { ...(slots || {}) };
+
+      // already complete? don't re-ask
+      const haveAll =
+        s.service_address &&
+        s.service_address.line1 &&
+        s.service_address.city &&
+        s.service_address.state &&
+        s.service_address.zip;
+      if (haveAll) return { slots: s, reply: null, handled: false };
+
+      const full = parseFullAddress(speech);
+      if (full) {
+        s.service_address = { ...(s.service_address || {}), ...full };
+        return {
+          slots: s,
+          reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
+          handled: true
+        };
+      }
+      const line1 = parseAddressLine1(speech);
+      const csz = parseCityStateZip(speech);
+
+      if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
+        s.service_address = { ...(s.service_address || {}), line1 };
+        return { slots: s, reply: 'Thanks. And what are the city, state, and zip?', handled: true };
+      }
+      if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
+        s.service_address = { ...(s.service_address || {}), ...csz };
+        return { slots: s, reply: 'Thanks. And what is the street address?', handled: true };
+      }
+      return { slots: s, reply: null, handled: false };
+    })(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
       return res.status(200).json({
-        reply: addrProgress.reply,
+        reply: enforceHVACBranding(addrProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -504,19 +461,10 @@ export default async function handler(req, res) {
         if (val !== null) setThermo('setpoint', val);
       } else if (path === 'callback_number') {
         const phone = parsePhone(speech);
-        if (phone?.complete) {
-          mergedSlots.callback_number = phone.full;
-          applied = true;
-          confirm = `Got it — updating the callback number to ${phone.full}.`;
-        }
+        if (phone?.complete) { mergedSlots.callback_number = phone.full; applied = true; confirm = `Got it — updating the callback number to ${phone.full}.`; }
       } else if (path === 'service_address.line1') {
         const line1 = parseAddressLine1(speech);
-        if (line1) {
-          mergedSlots.service_address = mergedSlots.service_address || {};
-          mergedSlots.service_address.line1 = line1;
-          applied = true;
-          confirm = `Thanks — updating the street address to ${line1}.`;
-        }
+        if (line1) { mergedSlots.service_address = mergedSlots.service_address || {}; mergedSlots.service_address.line1 = line1; applied = true; confirm = `Thanks — updating the street address to ${line1}.`; }
       } else if (path === 'service_address.city_state_zip') {
         const csz = parseCityStateZip(speech) || parseFullAddress(speech);
         if (csz) {
@@ -528,19 +476,31 @@ export default async function handler(req, res) {
           confirm = `Thanks — updating city, state, and zip to ${csz.city}, ${csz.state} ${csz.zip}.`;
         }
       } else if (path === 'unspecified') {
-        const { slots: s2, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
+        // try broad corrections (phone, units, thermo)
+        const s2 = { ...(mergedSlots || {}) };
+        let corrected = false; const notes = [];
+
+        const sp = parseThermostatSetpoint(speech);
+        if (sp !== null) { s2.thermostat = s2.thermostat || {}; s2.thermostat.setpoint = sp; corrected = true; notes.push(`thermostat setpoint to ${sp}°`); }
+        const cur = parseThermostatCurrent(speech);
+        if (cur !== null) { s2.thermostat = s2.thermostat || {}; s2.thermostat.current = cur; corrected = true; notes.push(`current temperature to ${cur}°`); }
+        const phone = parsePhone(speech);
+        if (phone?.complete) { s2.callback_number = phone.full; corrected = true; notes.push(`callback number to ${phone.full}`); }
+        const uc = parseUnitCount(speech);
+        if (uc !== null) { s2.unit_count = uc; corrected = true; notes.push(`unit count to ${uc}`); }
+
         if (corrected) {
           mergedSlots = s2;
           applied = true;
-          confirm = `Thanks — I've updated ${correctionSummary.join(', ')}.`;
+          confirm = `Thanks — I've updated ${notes.join(', ')}.`;
         }
       }
 
       if (applied) {
         mergedSlots.pending_fix = null;
-        mergedSlots.confirmation_pending = false; // ensure we don't jump to bye until we re-confirm
+        mergedSlots.confirmation_pending = false;
         return res.status(200).json({
-          reply: confirm + ' Anything else you’d like to adjust?',
+          reply: enforceHVACBranding(confirm + ' Anything else you’d like to adjust?'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -549,11 +509,10 @@ export default async function handler(req, res) {
           usage: null,
         });
       } else {
-        // allow "let's continue" to cancel being stuck here
-        if (isAffirmation(speech)) {
+        if (wantsToContinue(speech)) {
           mergedSlots.pending_fix = null;
           return res.status(200).json({
-            reply: "No worries—let’s keep going.",
+            reply: 'No worries—let’s keep going.',
             slots: mergedSlots,
             done: false,
             goodbye: null,
@@ -575,30 +534,11 @@ export default async function handler(req, res) {
       }
     }
 
-    // ---- Explicit value corrections (no pending_fix) ----
-    {
-      const { slots: updatedSlots, corrected, correctionSummary } = detectCorrections(speech, mergedSlots);
-      if (corrected) {
-        mergedSlots = updatedSlots;
-        const msg = `Thanks for the clarification. I've updated ${correctionSummary.join(', ')}. Let's continue.`;
-        return res.status(200).json({
-          reply: msg,
-          slots: mergedSlots,
-          done: false,
-          goodbye: null,
-          needs_confirmation: false,
-          model: 'gpt-4o-mini',
-          usage: null,
-        });
-      }
-    }
-
-    // ---- Generic correction detector (creates pending_fix) ----
-    const pf = detectGenericCorrection(speech, mergedSlots);
-    if (pf) {
-      mergedSlots.pending_fix = pf;
+    // ---- If caller says “let’s continue”, jump to next missing thing
+    if (wantsToContinue(speech)) {
+      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. Let’s schedule your visit.';
       return res.status(200).json({
-        reply: pf.prompt,
+        reply: enforceHVACBranding(prompt),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -625,7 +565,7 @@ export default async function handler(req, res) {
       { role: 'system', content: SYSTEM_PROMPT },
       ...history,
       { role: 'assistant', content: steering },
-      { role: 'user', content: speech },
+      { role: 'user', content: speech }
     ];
 
     const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
@@ -644,18 +584,13 @@ export default async function handler(req, res) {
         messages,
       }),
       signal: t.signal,
-    })
-      .catch((e) => {
-        throw e;
-      })
-      .finally(() => t.cancel());
+    }).catch(e => { throw e; }).finally(() => t.cancel());
 
     if (!resp?.ok) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply:
-          'Thanks. Please share the full service address, including city, state, and zip.',
+        reply: 'Thanks. Please share the full service address, including city, state, and zip.',
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -669,12 +604,10 @@ export default async function handler(req, res) {
     const raw = data?.choices?.[0]?.message?.content ?? '{}';
 
     let parsed;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
+    try { parsed = JSON.parse(raw); }
+    catch {
       parsed = {
-        reply:
-          'Thanks. What’s the next detail—your full service address with city, state, and zip?',
+        reply: 'Thanks. What’s the next detail—your full service address with city, state, and zip?',
         slots: {},
         done: false,
         goodbye: null,
@@ -683,8 +616,7 @@ export default async function handler(req, res) {
     }
 
     if (typeof parsed.reply !== 'string') {
-      parsed.reply =
-        'Thanks. What’s the next detail—your full service address with city, state, and zip?';
+      parsed.reply = 'Thanks. What’s the next detail—your full service address with city, state, and zip?';
     }
     if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
@@ -698,9 +630,9 @@ export default async function handler(req, res) {
     }
     if (mergedSlots.pricing_disclosed !== true) {
       const lastAssistantLines = [...history, { role: 'assistant', content: parsed.reply || '' }]
-        .filter((m) => m.role === 'assistant')
+        .filter(m => m.role === 'assistant')
         .slice(-8)
-        .map((m) => m.content || '');
+        .map(m => m.content || '');
       if (lastAssistantLines.some(statementMentionsPricing)) {
         mergedSlots.pricing_disclosed = true;
       }
@@ -714,24 +646,24 @@ export default async function handler(req, res) {
     const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
 
-    // Suppress pricing repeats; add empathy if needed
-    parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
-    parsed.reply = addEmpathy(speech, parsed.reply);
+    // Prevent repeated thermostat question if both values are present
+    if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
+        (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
+      parsed.reply = 'Great—thanks. Let’s schedule your visit.';
+    }
 
-    // ---- Prevent re-asking for already-filled items
-    const addr = mergedSlots.service_address || {};
-    if (/city|state|zip|address/i.test(parsed.reply) && addr.line1 && addr.city && addr.state && addr.zip) {
-      parsed.reply = 'Thanks. What’s the next detail—your AC brand (if you know it)?';
+    // If model says "schedule your visit" but we're missing required pieces, push next missing prompt
+    if (/schedule.*visit/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
+      const prompt = nextMissingPrompt(mergedSlots);
+      if (prompt) parsed.reply = prompt;
     }
-    if (/phone|callback/i.test(parsed.reply) && mergedSlots.callback_number) {
-      parsed.reply = 'Great—thanks. What brand are your AC units, if you know?';
-    }
-    if (/how many units|unit count/i.test(parsed.reply) && Number.isFinite(mergedSlots.unit_count)) {
-      parsed.reply = 'Thanks. Where are the units located?';
-    }
-    if (/where.*located/i.test(parsed.reply) && mergedSlots.unit_locations) {
-      parsed.reply = 'Got it. What symptoms are you seeing?';
-    }
+
+    // Final cleanups
+    parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
+    parsed.reply = suppressMembershipUntilBooked(parsed.reply, mergedSlots);
+    parsed.reply = addEmpathy(speech, parsed.reply);
+    parsed.reply = stripRepeatedGreeting(history, parsed.reply);
+    parsed.reply = enforceHVACBranding(parsed.reply);
 
     // done?
     const serverDone = serverSideDoneCheck(mergedSlots);
@@ -739,23 +671,18 @@ export default async function handler(req, res) {
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      replyOut =
-        "Here’s a quick summary:\n" +
-        summaryFromSlots(mergedSlots) +
-        "\nIs everything correct? If not, say what you’d like to change.";
+      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
       needs_confirmation = true;
-      mergedSlots.confirmation_pending = true; // <-- key for next turn
+      mergedSlots.confirmation_pending = true;
     }
 
     return res.status(200).json({
-      reply: serverDone ? replyOut : parsed.reply,
+      reply: replyOut,
       slots: mergedSlots,
       done: serverDone && !needs_confirmation,
-      goodbye:
-        serverDone && !needs_confirmation
-          ? parsed.goodbye ||
-            'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.'
-          : null,
+      goodbye: serverDone && !needs_confirmation
+        ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
+        : null,
       needs_confirmation,
       model: 'gpt-4o-mini',
       usage: data?.usage ?? null,
@@ -763,8 +690,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply:
-        'I caught that. When you’re ready, please share the full service address, including city, state, and zip.',
+      reply: "I caught that. When you’re ready, please share the full service address, including city, state, and zip.",
       slots: (req.body && req.body.lastSlots) || {},
       done: false,
       goodbye: null,
