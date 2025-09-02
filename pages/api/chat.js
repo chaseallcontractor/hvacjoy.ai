@@ -73,10 +73,7 @@ slots schema:
   "pricing_disclosed": true | false,
   "emergency": false | true,
 
-  // For targeted follow-ups when caller says “that’s not right…”
   "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" },
-
-  // Final “yes/no summary” state
   "confirmation_pending": null | true | false
 }
 
@@ -148,7 +145,7 @@ function statementMentionsPricing(text) {
 }
 function inferYesNoCallAhead(text) {
   const t = (text || '').toLowerCase();
-  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay|yeah)\b/.test(t)) return true;
+  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay)\b/.test(t)) return true;
   if (/\b(no|nope|nah|don’t|do not|no thanks|not necessary)\b/.test(t)) return false;
   return null;
 }
@@ -213,7 +210,7 @@ function parseThermostatSetpoint(text) {
     const b = parseInt(twoNums[2], 10);
     if (!Number.isNaN(a) && !Number.isNaN(b)) return Math.max(a, b);
   }
-  const direct = t.match(/\b(set\s*point|setpoint|thermostat|set\s*point)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
+  const direct = t.match(/\b(set\s*point|setpoint|thermostat)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
   if (direct) {
     const val = parseInt(direct[3], 10);
     if (!Number.isNaN(val)) return val;
@@ -239,7 +236,7 @@ function parseUnitCount(text) {
   return null;
 }
 
-// ----------------- Helpers to steer/clean replies ------------------
+// ----------------- Steer/clean replies ------------------
 function wantsToContinue(text='') {
   return /\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(text || '');
 }
@@ -266,8 +263,7 @@ function nextMissingPrompt(s) {
   if (!s.full_name) return 'Can I have your full name?';
   if (!s.callback_number) return 'Great. What’s the best callback number?';
   if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
-    if (!addr.line1) return 'What is the street address?';
-    return 'And the city, state, and zip?';
+    return 'Please say the full service address in one sentence, including street, city, state, and zip.';
   }
   if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
   if (!((s.thermostat||{}).setpoint != null && (s.thermostat||{}).current != null)) {
@@ -355,6 +351,35 @@ function serverSideDoneCheck(slots) {
   );
 }
 
+// ---- Address progress: accept ONLY a complete, one-line address
+function handleAddressProgress_STRICT(speech, slots) {
+  const s = { ...(slots || {}) };
+
+  const haveAll =
+    s.service_address &&
+    s.service_address.line1 &&
+    s.service_address.city &&
+    s.service_address.state &&
+    s.service_address.zip;
+  if (haveAll) return { slots: s, reply: null, handled: false };
+
+  const full = parseFullAddress(speech);
+  if (full) {
+    s.service_address = { ...(s.service_address || {}), ...full };
+    return {
+      slots: s,
+      reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
+      handled: true
+    };
+  }
+
+  return {
+    slots: s,
+    reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 242 Lost Meadows Drive, Dallas, GA 30157.',
+    handled: true
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -372,6 +397,8 @@ export default async function handler(req, res) {
 
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
+    // Never start in confirmation mode unless we explicitly set it later
+    if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
 
     // --- Confirmation gate (after summary) ---
     if (mergedSlots.confirmation_pending === true) {
@@ -379,7 +406,7 @@ export default async function handler(req, res) {
         const goodbye = 'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.';
         mergedSlots.confirmation_pending = false;
         return res.status(200).json({
-          reply: 'Great — we’re all set.',
+          reply: enforceHVACBranding('Great — we’re all set.'),
           slots: mergedSlots,
           done: true,
           goodbye,
@@ -391,41 +418,8 @@ export default async function handler(req, res) {
       // if they say it's wrong, fall through to correction flows
     }
 
-    // ---- Address progress (prevents premature re-asks) ----
-    const addrProgress = (function handleAddressProgress(speech, slots) {
-      const s = { ...(slots || {}) };
-
-      // already complete? don't re-ask
-      const haveAll =
-        s.service_address &&
-        s.service_address.line1 &&
-        s.service_address.city &&
-        s.service_address.state &&
-        s.service_address.zip;
-      if (haveAll) return { slots: s, reply: null, handled: false };
-
-      const full = parseFullAddress(speech);
-      if (full) {
-        s.service_address = { ...(s.service_address || {}), ...full };
-        return {
-          slots: s,
-          reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
-          handled: true
-        };
-      }
-      const line1 = parseAddressLine1(speech);
-      const csz = parseCityStateZip(speech);
-
-      if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
-        s.service_address = { ...(s.service_address || {}), line1 };
-        return { slots: s, reply: 'Thanks. And what are the city, state, and zip?', handled: true };
-      }
-      if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
-        s.service_address = { ...(s.service_address || {}), ...csz };
-        return { slots: s, reply: 'Thanks. And what is the street address?', handled: true };
-      }
-      return { slots: s, reply: null, handled: false };
-    })(speech, mergedSlots);
+    // ---- Strict address capture (one-line only)
+    const addrProgress = handleAddressProgress_STRICT(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
       return res.status(200).json({
@@ -439,7 +433,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Pending fix flow (generic corrections) ----
+    // ---- Pending fix flow (generic corrections)
     if (mergedSlots.pending_fix) {
       const pf = mergedSlots.pending_fix;
       let applied = false;
@@ -475,25 +469,6 @@ export default async function handler(req, res) {
           applied = true;
           confirm = `Thanks — updating city, state, and zip to ${csz.city}, ${csz.state} ${csz.zip}.`;
         }
-      } else if (path === 'unspecified') {
-        // try broad corrections (phone, units, thermo)
-        const s2 = { ...(mergedSlots || {}) };
-        let corrected = false; const notes = [];
-
-        const sp = parseThermostatSetpoint(speech);
-        if (sp !== null) { s2.thermostat = s2.thermostat || {}; s2.thermostat.setpoint = sp; corrected = true; notes.push(`thermostat setpoint to ${sp}°`); }
-        const cur = parseThermostatCurrent(speech);
-        if (cur !== null) { s2.thermostat = s2.thermostat || {}; s2.thermostat.current = cur; corrected = true; notes.push(`current temperature to ${cur}°`); }
-        const phone = parsePhone(speech);
-        if (phone?.complete) { s2.callback_number = phone.full; corrected = true; notes.push(`callback number to ${phone.full}`); }
-        const uc = parseUnitCount(speech);
-        if (uc !== null) { s2.unit_count = uc; corrected = true; notes.push(`unit count to ${uc}`); }
-
-        if (corrected) {
-          mergedSlots = s2;
-          applied = true;
-          confirm = `Thanks — I've updated ${notes.join(', ')}.`;
-        }
       }
 
       if (applied) {
@@ -509,21 +484,8 @@ export default async function handler(req, res) {
           usage: null,
         });
       } else {
-        if (wantsToContinue(speech)) {
-          mergedSlots.pending_fix = null;
-          return res.status(200).json({
-            reply: 'No worries—let’s keep going.',
-            slots: mergedSlots,
-            done: false,
-            goodbye: null,
-            needs_confirmation: false,
-            model: 'gpt-4o-mini',
-            usage: null,
-          });
-        }
-        const prompt = pf.prompt || 'What should it be?';
         return res.status(200).json({
-          reply: prompt,
+          reply: enforceHVACBranding(pf.prompt || 'What should it be?'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -590,7 +552,7 @@ export default async function handler(req, res) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: 'Thanks. Please share the full service address, including city, state, and zip.',
+        reply: enforceHVACBranding('Thanks. Please say the full service address in one sentence, including street, city, state, and zip.'),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -690,7 +652,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply: "I caught that. When you’re ready, please share the full service address, including city, state, and zip.",
+      reply: enforceHVACBranding("I caught that. When you’re ready, please say the full service address in one sentence, including street, city, state, and zip."),
       slots: (req.body && req.body.lastSlots) || {},
       done: false,
       goodbye: null,
