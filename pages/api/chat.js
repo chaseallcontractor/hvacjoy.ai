@@ -106,9 +106,9 @@ async function fetchHistoryMessages(callSid) {
       .order('turn_index', { ascending: true })
       .limit(50);
 
-    return (data || []).map(r => ({
+    return (data || []).map((r) => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
-      content: r.text || ''
+      content: r.text || '',
     }));
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
@@ -116,21 +116,22 @@ async function fetchHistoryMessages(callSid) {
   }
 }
 
+// ----------------- Slot merge -----------------
 function mergeSlots(oldSlots = {}, newSlots = {}) {
   const merged = { ...(oldSlots || {}) };
   for (const [k, v] of Object.entries(newSlots || {})) {
     if (v && typeof v === 'object' && !Array.isArray(v)) {
       merged[k] = mergeSlots(merged[k] || {}, v);
     } else if (Array.isArray(v)) {
-      merged[k] = v.length ? v : (merged[k] || []);
+      merged[k] = v.length ? v : merged[k] || [];
     } else {
-      merged[k] = (v ?? merged[k] ?? null);
+      merged[k] = v ?? merged[k] ?? null;
     }
   }
   return merged;
 }
 
-// ---------- Heuristics -----------------------------------------------------
+// ---------- Heuristics ----------
 function inferPreferredWindowFrom(text) {
   const t = (text || '').toLowerCase();
   if (/\bmorning\b/.test(t)) return 'morning';
@@ -149,7 +150,7 @@ function inferYesNoCallAhead(text) {
   return null;
 }
 function getLastAssistantQuestion(history) {
-  const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
+  const assistantLines = (history || []).filter((m) => m.role === 'assistant').map((m) => m.content);
   for (let i = assistantLines.length - 1; i >= 0; i--) {
     const line = (assistantLines[i] || '').trim();
     if (line.endsWith('?')) return line;
@@ -158,23 +159,56 @@ function getLastAssistantQuestion(history) {
 }
 
 // ----------------- Parsing helpers ------------------
+const STATE_MAP = {
+  alabama:'AL', alaska:'AK', arizona:'AZ', arkansas:'AR', california:'CA', colorado:'CO',
+  connecticut:'CT', delaware:'DE', 'district of columbia':'DC', florida:'FL', georgia:'GA',
+  hawaii:'HI', idaho:'ID', illinois:'IL', indiana:'IN', iowa:'IA', kansas:'KS', kentucky:'KY',
+  louisiana:'LA', maine:'ME', maryland:'MD', massachusetts:'MA', michigan:'MI', minnesota:'MN',
+  mississippi:'MS', missouri:'MO', montana:'MT', nebraska:'NE', nevada:'NV', 'new hampshire':'NH',
+  'new jersey':'NJ', 'new mexico':'NM', 'new york':'NY', 'north carolina':'NC', 'north dakota':'ND',
+  ohio:'OH', oklahoma:'OK', oregon:'OR', pennsylvania:'PA', 'rhode island':'RI',
+  'south carolina':'SC', 'south dakota':'SD', tennessee:'TN', texas:'TX', utah:'UT',
+  vermont:'VT', virginia:'VA', washington:'WA', 'west virginia':'WV', wisconsin:'WI', wyoming:'WY'
+};
+function normState(s) {
+  if (!s) return null;
+  const up = s.trim().toUpperCase();
+  if (/^[A-Z]{2}$/.test(up)) return up;
+  const abbr = STATE_MAP[(s || '').toLowerCase()];
+  return abbr || null;
+}
+
 function parseFullAddress(line) {
-  const m = (line || '').match(/\b(\d{2,8}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/i);
+  // allow commas in street and full state names; support ZIP+4
+  const m = (line || '').match(
+    /\b(\d{2,8}\s+[A-Za-z0-9.\s,]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/i
+  );
   if (!m) return null;
-  return { line1: m[1].trim(), city: m[2].trim(), state: m[3].toUpperCase(), zip: m[4] };
+  const state = normState(m[3]);
+  return {
+    line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
+    city: m[2].trim(),
+    state: state || m[3].trim().toUpperCase(),
+    zip: m[4],
+  };
 }
 function parseAddressLine1(text) {
-  const m = (text || '').match(/\b(\d{2,8}\s+[A-Za-z0-9.\s]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i);
-  return m ? m[1].trim() : null;
+  const m = (text || '').match(
+    /\b(\d{2,8}\s+[A-Za-z0-9.\s,]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i
+  );
+  return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
 function parseCityStateZip(text) {
-  const m = (text || '').match(/\b([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2})\s+(\d{5})\b/);
-  if (m) return { city: m[1].trim(), state: m[2].toUpperCase(), zip: m[3] };
-  return null;
+  const m = (text || '').match(/\b([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/);
+  if (!m) return null;
+  const st = normState(m[2]);
+  return { city: m[1].trim(), state: st || m[2].trim().toUpperCase(), zip: m[3] };
 }
 function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
-  const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
+  const twoNums =
+    t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) ||
+    t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
   if (twoNums) {
     const a = parseInt(twoNums[1], 10);
     const b = parseInt(twoNums[2], 10);
@@ -193,7 +227,11 @@ function parseThermostatCurrent(text) {
 }
 function parsePhone(text) {
   const digits = (text || '').replace(/\D+/g, '');
-  if (digits.length === 10) return `${digits.slice(0,3)}-${digits.slice(3,6)}-${digits.slice(6)}`;
+  if (digits.length >= 10) {
+    const last10 = digits.slice(-10);
+    return { full: `${last10.slice(0,3)}-${last10.slice(3,6)}-${last10.slice(6)}`, complete: true };
+  }
+  if (digits.length >= 6) return { partial: digits, complete: false };
   return null;
 }
 function parseUnitCount(text) {
@@ -205,17 +243,35 @@ function parseUnitCount(text) {
 // ----------------- Corrections / Address-progress ------------------
 function handleAddressProgress(speech, slots) {
   const s = { ...(slots || {}) };
+
+  // if we already have full address, don't ask again
+  const haveAll =
+    s.service_address &&
+    s.service_address.line1 &&
+    s.service_address.city &&
+    s.service_address.state &&
+    s.service_address.zip;
+  if (haveAll) return { slots: s, reply: null, handled: false };
+
   const full = parseFullAddress(speech);
   if (full) {
     s.service_address = { ...(s.service_address || {}), ...full };
-    return { slots: s, reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`, handled: true };
+    return {
+      slots: s,
+      reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
+      handled: true,
+    };
   }
   const line1 = parseAddressLine1(speech);
   const csz = parseCityStateZip(speech);
 
   if (line1 && !(csz && csz.city && csz.state && csz.zip)) {
     s.service_address = { ...(s.service_address || {}), line1 };
-    return { slots: s, reply: 'Thanks. And what are the city, state, and zip?', handled: true };
+    return {
+      slots: s,
+      reply: 'Thanks. And what are the city, state, and zip?',
+      handled: true,
+    };
   }
   if (csz && csz.city && csz.state && csz.zip && !(s.service_address && s.service_address.line1)) {
     s.service_address = { ...(s.service_address || {}), ...csz };
@@ -250,10 +306,19 @@ function detectCorrections(speech, slots) {
   }
 
   const phone = parsePhone(speech);
-  if (phone && s.callback_number !== phone) {
-    s.callback_number = phone;
-    corrected = true;
-    notes.push(`callback number to ${phone}`);
+  if (phone) {
+    if (phone.complete) {
+      if (s.callback_number !== phone.full) {
+        s.callback_number = phone.full;
+        corrected = true;
+        notes.push(`callback number to ${phone.full}`);
+      }
+    } else {
+      s.pending_fix = {
+        field: 'callback_number',
+        prompt: 'Could you give me the full 10-digit callback number?',
+      };
+    }
   }
 
   const uc = parseUnitCount(speech);
@@ -334,7 +399,7 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
     mergedSlots.preferred_window = win;
     return {
       newReply: `Got it — we'll reserve the ${win} window. Do you prefer tomorrow, or another date?`,
-      updated: true
+      updated: true,
     };
   }
   return { newReply: null, updated: false };
@@ -358,6 +423,14 @@ function addEmpathy(speech, reply) {
   return reply;
 }
 
+// quick yes/no helpers for confirmation gate
+function isAffirmation(text = '') {
+  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
+}
+function isNegation(text = '') {
+  return /\b(no|nope|nah|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -376,7 +449,25 @@ export default async function handler(req, res) {
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
 
-    // ---- Address progress (prevents premature "updated to 242 …") ----
+    // --- Confirmation gate (after summary) ---
+    if (mergedSlots.confirmation_pending === true) {
+      if (isAffirmation(speech) && !isNegation(speech)) {
+        const goodbye = 'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.';
+        mergedSlots.confirmation_pending = false;
+        return res.status(200).json({
+          reply: 'Great — we’re all set.',
+          slots: mergedSlots,
+          done: true,
+          goodbye,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      // if they say it's wrong, fall through to correction flows
+    }
+
+    // ---- Address progress (prevents premature re-asks) ----
     const addrProgress = handleAddressProgress(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
@@ -413,10 +504,19 @@ export default async function handler(req, res) {
         if (val !== null) setThermo('setpoint', val);
       } else if (path === 'callback_number') {
         const phone = parsePhone(speech);
-        if (phone) { mergedSlots.callback_number = phone; applied = true; confirm = `Got it — updating the callback number to ${phone}.`; }
+        if (phone?.complete) {
+          mergedSlots.callback_number = phone.full;
+          applied = true;
+          confirm = `Got it — updating the callback number to ${phone.full}.`;
+        }
       } else if (path === 'service_address.line1') {
         const line1 = parseAddressLine1(speech);
-        if (line1) { mergedSlots.service_address = mergedSlots.service_address || {}; mergedSlots.service_address.line1 = line1; applied = true; confirm = `Thanks — updating the street address to ${line1}.`; }
+        if (line1) {
+          mergedSlots.service_address = mergedSlots.service_address || {};
+          mergedSlots.service_address.line1 = line1;
+          applied = true;
+          confirm = `Thanks — updating the street address to ${line1}.`;
+        }
       } else if (path === 'service_address.city_state_zip') {
         const csz = parseCityStateZip(speech) || parseFullAddress(speech);
         if (csz) {
@@ -438,6 +538,7 @@ export default async function handler(req, res) {
 
       if (applied) {
         mergedSlots.pending_fix = null;
+        mergedSlots.confirmation_pending = false; // ensure we don't jump to bye until we re-confirm
         return res.status(200).json({
           reply: confirm + ' Anything else you’d like to adjust?',
           slots: mergedSlots,
@@ -448,6 +549,19 @@ export default async function handler(req, res) {
           usage: null,
         });
       } else {
+        // allow "let's continue" to cancel being stuck here
+        if (isAffirmation(speech)) {
+          mergedSlots.pending_fix = null;
+          return res.status(200).json({
+            reply: "No worries—let’s keep going.",
+            slots: mergedSlots,
+            done: false,
+            goodbye: null,
+            needs_confirmation: false,
+            model: 'gpt-4o-mini',
+            usage: null,
+          });
+        }
         const prompt = pf.prompt || 'What should it be?';
         return res.status(200).json({
           reply: prompt,
@@ -511,7 +625,7 @@ export default async function handler(req, res) {
       { role: 'system', content: SYSTEM_PROMPT },
       ...history,
       { role: 'assistant', content: steering },
-      { role: 'user', content: speech }
+      { role: 'user', content: speech },
     ];
 
     const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
@@ -530,14 +644,18 @@ export default async function handler(req, res) {
         messages,
       }),
       signal: t.signal,
-    }).catch(e => { throw e; })
+    })
+      .catch((e) => {
+        throw e;
+      })
       .finally(() => t.cancel());
 
     if (!resp?.ok) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: "Thanks. Please share the full service address, including city, state, and zip.",
+        reply:
+          'Thanks. Please share the full service address, including city, state, and zip.',
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -551,10 +669,12 @@ export default async function handler(req, res) {
     const raw = data?.choices?.[0]?.message?.content ?? '{}';
 
     let parsed;
-    try { parsed = JSON.parse(raw); }
-    catch {
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
       parsed = {
-        reply: "Thanks. What’s the next detail—your full service address with city, state, and zip?",
+        reply:
+          'Thanks. What’s the next detail—your full service address with city, state, and zip?',
         slots: {},
         done: false,
         goodbye: null,
@@ -563,7 +683,8 @@ export default async function handler(req, res) {
     }
 
     if (typeof parsed.reply !== 'string') {
-      parsed.reply = "Thanks. What’s the next detail—your full service address with city, state, and zip?";
+      parsed.reply =
+        'Thanks. What’s the next detail—your full service address with city, state, and zip?';
     }
     if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
@@ -577,9 +698,9 @@ export default async function handler(req, res) {
     }
     if (mergedSlots.pricing_disclosed !== true) {
       const lastAssistantLines = [...history, { role: 'assistant', content: parsed.reply || '' }]
-        .filter(m => m.role === 'assistant')
+        .filter((m) => m.role === 'assistant')
         .slice(-8)
-        .map(m => m.content || '');
+        .map((m) => m.content || '');
       if (lastAssistantLines.some(statementMentionsPricing)) {
         mergedSlots.pricing_disclosed = true;
       }
@@ -597,23 +718,44 @@ export default async function handler(req, res) {
     parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
     parsed.reply = addEmpathy(speech, parsed.reply);
 
+    // ---- Prevent re-asking for already-filled items
+    const addr = mergedSlots.service_address || {};
+    if (/city|state|zip|address/i.test(parsed.reply) && addr.line1 && addr.city && addr.state && addr.zip) {
+      parsed.reply = 'Thanks. What’s the next detail—your AC brand (if you know it)?';
+    }
+    if (/phone|callback/i.test(parsed.reply) && mergedSlots.callback_number) {
+      parsed.reply = 'Great—thanks. What brand are your AC units, if you know?';
+    }
+    if (/how many units|unit count/i.test(parsed.reply) && Number.isFinite(mergedSlots.unit_count)) {
+      parsed.reply = 'Thanks. Where are the units located?';
+    }
+    if (/where.*located/i.test(parsed.reply) && mergedSlots.unit_locations) {
+      parsed.reply = 'Got it. What symptoms are you seeing?';
+    }
+
     // done?
     const serverDone = serverSideDoneCheck(mergedSlots);
 
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
+      replyOut =
+        "Here’s a quick summary:\n" +
+        summaryFromSlots(mergedSlots) +
+        "\nIs everything correct? If not, say what you’d like to change.";
       needs_confirmation = true;
+      mergedSlots.confirmation_pending = true; // <-- key for next turn
     }
 
     return res.status(200).json({
       reply: serverDone ? replyOut : parsed.reply,
       slots: mergedSlots,
       done: serverDone && !needs_confirmation,
-      goodbye: serverDone && !needs_confirmation
-        ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
-        : null,
+      goodbye:
+        serverDone && !needs_confirmation
+          ? parsed.goodbye ||
+            'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.'
+          : null,
       needs_confirmation,
       model: 'gpt-4o-mini',
       usage: data?.usage ?? null,
@@ -621,8 +763,9 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply: "I caught that. When you’re ready, please share the full service address, including city, state, and zip.",
-      slots: lastSlots || {},
+      reply:
+        'I caught that. When you’re ready, please share the full service address, including city, state, and zip.',
+      slots: (req.body && req.body.lastSlots) || {},
       done: false,
       goodbye: null,
       needs_confirmation: false,
