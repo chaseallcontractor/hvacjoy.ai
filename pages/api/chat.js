@@ -75,7 +75,8 @@ slots schema:
 
   "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" },
   "confirmation_pending": null | true | false,
-  "summary_reads": null | <number>
+  "summary_reads": null | <number>,
+  "address_confirm_pending": null | true | false
 }
 
 Behavior
@@ -322,7 +323,7 @@ function addEmpathy(speech, reply) {
   return reply;
 }
 
-// quick yes/no helpers for confirmation gate
+// quick yes/no helpers
 function isAffirmation(text='') {
   return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
 }
@@ -383,6 +384,7 @@ function handleAddressProgress_STRICT(speech, slots) {
   const full = parseFullAddress(speech);
   if (full) {
     s.service_address = { ...(s.service_address || {}), ...full };
+    s.address_confirm_pending = true;
     return {
       slots: s,
       reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
@@ -392,7 +394,7 @@ function handleAddressProgress_STRICT(speech, slots) {
 
   return {
     slots: s,
-    reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 242 Lost Meadows Drive, Dallas, GA 30157.',
+    reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 123 Main Street, Washington, DC 10001.',
     handled: true
   };
 }
@@ -417,45 +419,46 @@ export default async function handler(req, res) {
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
 
-    // --- During confirmation: apply tweaks (e.g., call-ahead) without re-reading summary
-    if (mergedSlots.confirmation_pending === true) {
-      const callAhead = inferYesNoCallAhead(speech);
-      if (callAhead !== null) {
-        mergedSlots.call_ahead = callAhead;
+    // --- ADDRESS CONFIRMATION GATE ---
+    if (mergedSlots.address_confirm_pending === true) {
+      const addr = mergedSlots.service_address || {};
+      if (isAffirmation(speech) && !isNegation(speech)) {
+        mergedSlots.address_confirm_pending = false;
+        const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding('Got it — I’ll note that. Is everything correct now?'),
+          reply: enforceHVACBranding(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
-          needs_confirmation: true,
-          model: 'gpt-4o-mini',
-          usage: null,
-        });
-      }
-      if (isAffirmation(speech) && !isNegation(speech)) {
-        const goodbye = 'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.';
-        mergedSlots.confirmation_pending = false;
-        return res.status(200).json({
-          reply: enforceHVACBranding('Great — we’re all set.'),
-          slots: mergedSlots,
-          done: true,
-          goodbye,
           needs_confirmation: false,
           model: 'gpt-4o-mini',
           usage: null,
         });
       }
-      if (/summary|details|recap/i.test(speech)) {
+      if (isNegation(speech)) {
+        mergedSlots.address_confirm_pending = false;
+        // Clear address so we capture it again cleanly
+        mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
         return res.status(200).json({
-          reply: "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.",
+          reply: 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.',
           slots: mergedSlots,
           done: false,
           goodbye: null,
-          needs_confirmation: true,
+          needs_confirmation: false,
           model: 'gpt-4o-mini',
-          usage: null
+          usage: null,
         });
       }
+      // If they say something else, re-ask clearly for yes/no
+      return res.status(200).json({
+        reply: `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`,
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
     }
 
     // ---- Strict address capture (one-line only)
@@ -626,7 +629,7 @@ export default async function handler(req, res) {
       reply: replyOut,
       slots: mergedSlots,
       done: serverDone && !needs_confirmation,
-      goodbye: serverSideDoneCheck(mergedSlots) && !needs_confirmation
+      goodbye: serverDone && !needs_confirmation
         ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
         : null,
       needs_confirmation,
