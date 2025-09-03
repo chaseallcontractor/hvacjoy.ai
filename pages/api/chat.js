@@ -197,23 +197,36 @@ const STREET_SUFFIX =
 
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
-  const m = (txt || '').match(
-    new RegExp(
-      `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*([A-Za-z][A-Za-z\\s]+),?\\s*(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\s+(\\d{5})(?:-\\d{4})?\\b`,
-      'i'
-    )
+
+  // City made non-greedy, add word boundary before ZIP, then fallback path
+  const re = new RegExp(
+    `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
+    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +                    // city (non-greedy)
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +   // state (full or 2-letter)
+    `(\\d{5})(?:-\\d{4})?\\b`,
+    'i'
   );
-  if (!m) return null;
-  const stateToken = m[3] || m[4];
-  const state = normState(stateToken);
-  if (!state) return null;
-  return {
-    line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
-    city: m[2].trim(),
-    state,
-    zip: m[5]
-  };
+
+  let m = txt.match(re);
+  if (m) {
+    const stateToken = m[3] || m[4];
+    const state = normState(stateToken);
+    if (!state) return null;
+    return {
+      line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
+      city: m[2].trim(),
+      state,
+      zip: m[5]
+    };
+  }
+
+  // Fallback: combine line1 + city/state/zip parsed separately
+  const line1 = parseAddressLine1(txt);
+  const csz = parseCityStateZip(txt);
+  if (line1 && csz) return { line1, ...csz };
+  return null;
 }
+
 function parseAddressLine1(text) {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
@@ -639,8 +652,11 @@ export default async function handler(req, res) {
       }
     }
     {
+      // Only infer call-ahead when the last asked question was about call-ahead
       const inferred = inferYesNoCallAhead(speech);
-      if (inferred !== null) mergedSlots.call_ahead = inferred;
+      if (inferred !== null && /call[- ]ahead/i.test(lastQ || '')) {
+        mergedSlots.call_ahead = inferred;
+      }
     }
 
     // Time-window repeat guard
