@@ -33,7 +33,7 @@ Call Flow
    - Thermostat setpoint and current reading
 4) Pricing disclosure before scheduling.
 5) Scheduling:
-   - Offer earliest availability + arrival window + call-ahead.
+   - Offer earliest availability, **ask for a date**, then arrival window + call-ahead.
 6) Membership check (after booking).
 7) Confirm & summarize.
 8) Close politely.
@@ -74,19 +74,17 @@ slots schema:
   "emergency": false | true,
 
   "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" },
-  "confirmation_pending": null | true | false
+  "confirmation_pending": null | true | false,
+  "summary_reads": null | <number>
 }
 
 Behavior
 - Continue the call. Do not repeat the greeting (“Welcome to H.V.A.C Joy…”).
 - Do NOT ask again for any slot already non-null in "known slots".
 - Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
-- If the caller corrects a prior detail (e.g., “70 not 17”), acknowledge, update, and confirm the new value.
-- If the caller gives a generic correction (“that’s not right / I need to change the current reading”), ask a targeted follow-up to capture the value, then update and reflect it back.
-- Set done=true only after:
-  full_name, callback_number, service_address.line1/city/state/zip,
-  pricing_disclosed=true, and (preferred_date OR preferred_window).
-- When done is reached, ALWAYS read a short summary and ask “Is everything correct? If not, say what you’d like to change.”
+- Require a date for booking (not only a window). Ask for date first, then window.
+- If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
+- When done is reached, read a short summary **once**, then ask “Is everything correct?”
 `.trim();
 
 function withTimeout(ms) {
@@ -178,16 +176,14 @@ function normState(s) {
   return abbr || null;
 }
 
-// normalize punctuation for address parsing (handles "2478. Kaley walk. ...")
+// Normalize punctuation for address parsing (handles "2478. Kaley walk. …")
 function cleanAddressText(line = '') {
   return line
-    .replace(/(\d)\.(?=\s|$)/g, '$1')  // drop trailing dot after number
-    .replace(/\s*\.\s*/g, ' ')         // turn lone periods into spaces
+    .replace(/(\d)\.(?=\s|$)/g, '$1')
+    .replace(/\s*\.\s*/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
 }
-
-// include many common street suffixes (Walk, Trail, Circle, Parkway, etc.)
 const STREET_SUFFIX =
   '(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way|Walk|Trail|Trl|Circle|Cir|Parkway|Pkwy|Place|Pl|Terrace|Ter|Trace|Pass|Path|Point|Pt|Loop|Run|Highway|Hwy|Cove|Cv)';
 
@@ -208,13 +204,11 @@ function parseFullAddress(line) {
     zip: m[4]
   };
 }
-
 function parseAddressLine1(text) {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
   return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
-
 function parseCityStateZip(text) {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(/\b([A-Za-z][A-Za-z\s]+),?\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/);
@@ -222,7 +216,6 @@ function parseCityStateZip(text) {
   const st = normState(m[2]);
   return { city: m[1].trim(), state: st || m[2].trim().toUpperCase(), zip: m[3] };
 }
-
 function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
   const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
@@ -273,7 +266,7 @@ function stripRepeatedGreeting(history, reply) {
   return reply.replace(/^\s*welcome to h\.?v\.?a\.?c\.?\s+joy.*?(?:\.\s*|\s*$)/i, '').trim();
 }
 function suppressMembershipUntilBooked(reply, slots) {
-  const booked = !!(slots.preferred_window || slots.preferred_date);
+  const booked = !!(slots.preferred_window && slots.preferred_date);
   if (!booked && /member|maintenance program/i.test(reply)) {
     return 'Great—thanks. Let’s finish your booking first.';
   }
@@ -291,7 +284,8 @@ function nextMissingPrompt(s) {
     return 'What is the thermostat setpoint and the current reading?';
   }
   if (s.pricing_disclosed !== true) return 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
-  if (!(s.preferred_date || s.preferred_window)) return 'What time window works for you—morning or afternoon?';
+  if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
+  if (!s.preferred_window) return 'What time window works for you—morning or afternoon?';
   return null;
 }
 
@@ -303,7 +297,7 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   if (win && !mergedSlots.preferred_window) {
     mergedSlots.preferred_window = win;
     return {
-      newReply: `Got it — we'll reserve the ${win} window. Do you prefer tomorrow, or another date?`,
+      newReply: `Got it — we'll reserve the ${win} window. Which day works best for you?`,
       updated: true
     };
   }
@@ -313,7 +307,7 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
 // Suppress pricing repeats after it’s been disclosed
 function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
-    return 'Great—thanks for confirming. Let’s schedule your visit.';
+    return 'Great—thanks for confirming. Let’s get your visit on the calendar.';
   }
   return reply;
 }
@@ -349,7 +343,7 @@ function summaryFromSlots(s) {
   const cur = thermo.current != null ? thermo.current : 'Unknown';
   const window = s.preferred_window ? s.preferred_window : (s.preferred_date ? '' : 'unspecified');
   const date = s.preferred_date ? s.preferred_date : '';
-  const callAhead = (s.call_ahead === false) ? 'No call-ahead' : 'Call-ahead';
+  const callAhead = (s.call_ahead === false) ? 'No call-ahead' : (s.call_ahead === true ? 'Call-ahead' : 'Call-ahead requested');
   return `- Name: ${name}
 - Address: ${addrLine}
 - AC units: ${units}${locs}
@@ -360,6 +354,7 @@ function summaryFromSlots(s) {
 - Diagnostic fee: $50.`;
 }
 
+// REQUIRE both date and window now
 function serverSideDoneCheck(slots) {
   const s = slots || {};
   const addr = s.service_address || {};
@@ -368,7 +363,8 @@ function serverSideDoneCheck(slots) {
     !!s.callback_number &&
     !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
     s.pricing_disclosed === true &&
-    (s.preferred_date || s.preferred_window)
+    !!s.preferred_date &&
+    !!s.preferred_window
   );
 }
 
@@ -419,9 +415,23 @@ export default async function handler(req, res) {
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
+    if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
 
-    // --- Confirmation gate (after summary) ---
+    // --- During confirmation: apply tweaks (e.g., call-ahead) without re-reading summary
     if (mergedSlots.confirmation_pending === true) {
+      const callAhead = inferYesNoCallAhead(speech);
+      if (callAhead !== null) {
+        mergedSlots.call_ahead = callAhead;
+        return res.status(200).json({
+          reply: enforceHVACBranding('Got it — I’ll note that. Is everything correct now?'),
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: true,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
       if (isAffirmation(speech) && !isNegation(speech)) {
         const goodbye = 'You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.';
         mergedSlots.confirmation_pending = false;
@@ -435,7 +445,17 @@ export default async function handler(req, res) {
           usage: null,
         });
       }
-      // else fall through to corrections
+      if (/summary|details|recap/i.test(speech)) {
+        return res.status(200).json({
+          reply: "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.",
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: true,
+          model: 'gpt-4o-mini',
+          usage: null
+        });
+      }
     }
 
     // ---- Strict address capture (one-line only)
@@ -453,6 +473,20 @@ export default async function handler(req, res) {
       });
     }
 
+    // ---- “let’s continue” jumps to next missing item
+    if (wantsToContinue(speech)) {
+      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+      return res.status(200).json({
+        reply: enforceHVACBranding(prompt),
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
     // ---- Normal LLM step ---------------------------------------------------
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
@@ -460,6 +494,7 @@ export default async function handler(req, res) {
     const steering =
       'Continue the call. Do not repeat the greeting.' +
       '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
+      '\nRequire a date for booking. Ask for date first, then time window.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
       '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
       (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
@@ -554,11 +589,11 @@ export default async function handler(req, res) {
     // Prevent repeated thermostat question if both values are present
     if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
         (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
-      parsed.reply = 'Great—thanks. Let’s schedule your visit.';
+      parsed.reply = 'Great—thanks. Our diagnostic visit is $50 per non-working unit. What day works for your visit?';
     }
 
-    // If model says "schedule your visit" but we're missing required pieces, push next missing prompt
-    if (/schedule.*visit/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
+    // If the model says "schedule" but we’re missing required pieces, push next missing prompt
+    if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
       const prompt = nextMissingPrompt(mergedSlots);
       if (prompt) parsed.reply = prompt;
     }
@@ -576,7 +611,13 @@ export default async function handler(req, res) {
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
+      // Only read the summary the first time we reach done
+      if ((mergedSlots.summary_reads || 0) < 1) {
+        replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
+        mergedSlots.summary_reads = (mergedSlots.summary_reads || 0) + 1;
+      } else {
+        replyOut = 'Is everything correct? If not, say what you’d like to change.';
+      }
       needs_confirmation = true;
       mergedSlots.confirmation_pending = true;
     }
@@ -585,7 +626,7 @@ export default async function handler(req, res) {
       reply: replyOut,
       slots: mergedSlots,
       done: serverDone && !needs_confirmation,
-      goodbye: serverDone && !needs_confirmation
+      goodbye: serverSideDoneCheck(mergedSlots) && !needs_confirmation
         ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
         : null,
       needs_confirmation,
