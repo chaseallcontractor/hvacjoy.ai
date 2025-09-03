@@ -198,7 +198,7 @@ const STREET_SUFFIX =
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
 
-  // City made non-greedy, add word boundary before ZIP, then fallback path
+  // City non-greedy, word boundary before ZIP, then fallback path
   const re = new RegExp(
     `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +                    // city (non-greedy)
@@ -475,14 +475,26 @@ export default async function handler(req, res) {
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
 
-    // --- ADDRESS CONFIRMATION GATE ---
-    if (mergedSlots.address_confirm_pending === true) {
-      const addr = mergedSlots.service_address || {};
+    // --- FINAL CONFIRMATION GATE ---
+    if (mergedSlots.confirmation_pending === true) {
       if (isAffirmation(speech) && !isNegation(speech)) {
-        mergedSlots.address_confirm_pending = false;
-        const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+        mergedSlots.confirmation_pending = false;
+        const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.";
         return res.status(200).json({
-          reply: enforceHVACBranding(prompt),
+          reply: "Great—thanks. You’re all set.",
+          slots: mergedSlots,
+          done: true,
+          goodbye: bye,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+
+      if (isNegation(speech) || /\b(change|update|fix|wrong|not (right|correct))\b/i.test(speech)) {
+        mergedSlots.confirmation_pending = false;
+        return res.status(200).json({
+          reply: "No problem—what would you like to change?",
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -491,27 +503,14 @@ export default async function handler(req, res) {
           usage: null,
         });
       }
-      if (isNegation(speech)) {
-        mergedSlots.address_confirm_pending = false;
-        // Clear address so we capture it again cleanly
-        mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
-        return res.status(200).json({
-          reply: 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.',
-          slots: mergedSlots,
-          done: false,
-          goodbye: null,
-          needs_confirmation: false,
-          model: 'gpt-4o-mini',
-          usage: null,
-        });
-      }
-      // If they say something else, re-ask clearly for yes/no
+
+      // Unclear → ask for explicit yes/no or change
       return res.status(200).json({
-        reply: `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`,
+        reply: "If everything is correct, please say “yes.” Otherwise, tell me what to change.",
         slots: mergedSlots,
         done: false,
         goodbye: null,
-        needs_confirmation: false,
+        needs_confirmation: true,
         model: 'gpt-4o-mini',
         usage: null,
       });
@@ -547,8 +546,8 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- “let’s continue” jumps to next missing item
-    if (wantsToContinue(speech)) {
+    // ---- “let’s continue / move on” → next missing item (but not during gates)
+    if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
         reply: enforceHVACBranding(prompt),
@@ -657,6 +656,12 @@ export default async function handler(req, res) {
       if (inferred !== null && /call[- ]ahead/i.test(lastQ || '')) {
         mergedSlots.call_ahead = inferred;
       }
+    }
+
+    // If the model tries to schedule before price disclosure, force the price line
+    if (mergedSlots.pricing_disclosed !== true &&
+        /(?:schedule|book|calendar|what day works|time window|morning|afternoon)/i.test(parsed.reply || '')) {
+      parsed.reply = 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
     }
 
     // Time-window repeat guard
