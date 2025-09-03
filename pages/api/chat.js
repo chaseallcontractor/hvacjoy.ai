@@ -169,6 +169,13 @@ const STATE_MAP = {
   'south carolina':'SC', 'south dakota':'SD', tennessee:'TN', texas:'TX', utah:'UT',
   vermont:'VT', virginia:'VA', washington:'WA', 'west virginia':'WV', wisconsin:'WI', wyoming:'WY'
 };
+
+const STATE_NAMES = Object.keys(STATE_MAP);
+const STATE_NAME_RE = new RegExp(
+  `(?:${STATE_NAMES.map(s => s.replace(/\s+/g, '\\s+')).join('|')})`,
+  'i'
+);
+
 function normState(s) {
   if (!s) return null;
   const up = s.trim().toUpperCase();
@@ -192,17 +199,19 @@ function parseFullAddress(line) {
   const txt = cleanAddressText(line);
   const m = (txt || '').match(
     new RegExp(
-      `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*([A-Za-z][A-Za-z\\s]+),?\\s*([A-Za-z]{2}|[A-Za-z\\s]+)\\s+(\\d{5})(?:-\\d{4})?\\b`,
+      `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*([A-Za-z][A-Za-z\\s]+),?\\s*(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\s+(\\d{5})(?:-\\d{4})?\\b`,
       'i'
     )
   );
   if (!m) return null;
-  const state = normState(m[3]);
+  const stateToken = m[3] || m[4];
+  const state = normState(stateToken);
+  if (!state) return null;
   return {
     line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
     city: m[2].trim(),
-    state: state || m[3].trim().toUpperCase(),
-    zip: m[4]
+    state,
+    zip: m[5]
   };
 }
 function parseAddressLine1(text) {
@@ -210,12 +219,21 @@ function parseAddressLine1(text) {
   const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
   return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
-function parseCityStateZip(text) {
+function parseCityStateZip(text = '') {
   const txt = cleanAddressText(text);
-  const m = (txt || '').match(/\b([A-Za-z][A-Za-z\s]+),?\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/);
+  const m = (txt || '').match(
+    new RegExp(
+      `\\b([A-Za-z][A-Za-z\\s]+?),?\\s*(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\s+(\\d{5})(?:-\\d{4})?\\b`,
+      'i'
+    )
+  );
   if (!m) return null;
-  const st = normState(m[2]);
-  return { city: m[1].trim(), state: st || m[2].trim().toUpperCase(), zip: m[3] };
+  const city = m[1].trim();
+  const stateToken = m[2] || m[3];
+  const state = normState(stateToken);
+  if (!state) return null;
+  const zip = m[4];
+  return { city, state, zip };
 }
 function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
@@ -399,6 +417,31 @@ function handleAddressProgress_STRICT(speech, slots) {
   };
 }
 
+// ---- Phone progress: don’t store partials; confirm when complete
+function handlePhoneProgress(speech, slots) {
+  const s = { ...(slots || {}) };
+  if (s.callback_number) return { slots: s, reply: null, handled: false };
+
+  const p = parsePhone(speech);
+  if (!p) return { slots: s, reply: null, handled: false };
+
+  if (p.complete) {
+    s.callback_number = p.full;
+    return {
+      slots: s,
+      reply: `Thanks. I have your callback number as ${p.full}.`,
+      handled: true
+    };
+  }
+
+  // partial
+  return {
+    slots: s,
+    reply: 'I heard the beginning. What’s the full 10-digit callback number?',
+    handled: true
+  };
+}
+
 export default async function handler(req, res) {
   if (req.method !== 'POST') {
     res.setHeader('Allow', ['POST']);
@@ -467,6 +510,21 @@ export default async function handler(req, res) {
       mergedSlots = addrProgress.slots;
       return res.status(200).json({
         reply: enforceHVACBranding(addrProgress.reply),
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
+    // ---- Phone progress (accept full 10; reject partial)
+    const phoneProgress = handlePhoneProgress(speech, mergedSlots);
+    if (phoneProgress.handled) {
+      mergedSlots = phoneProgress.slots;
+      return res.status(200).json({
+        reply: enforceHVACBranding(phoneProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
