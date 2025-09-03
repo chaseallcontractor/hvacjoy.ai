@@ -177,9 +177,27 @@ function normState(s) {
   const abbr = STATE_MAP[(s||'').toLowerCase()];
   return abbr || null;
 }
+
+// normalize punctuation for address parsing (handles "2478. Kaley walk. ...")
+function cleanAddressText(line = '') {
+  return line
+    .replace(/(\d)\.(?=\s|$)/g, '$1')  // drop trailing dot after number
+    .replace(/\s*\.\s*/g, ' ')         // turn lone periods into spaces
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
+// include many common street suffixes (Walk, Trail, Circle, Parkway, etc.)
+const STREET_SUFFIX =
+  '(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way|Walk|Trail|Trl|Circle|Cir|Parkway|Pkwy|Place|Pl|Terrace|Ter|Trace|Pass|Path|Point|Pt|Loop|Run|Highway|Hwy|Cove|Cv)';
+
 function parseFullAddress(line) {
-  const m = (line || '').match(
-    /\b(\d{2,8}\s+[A-Za-z0-9.\s,]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b[, ]+\s*([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/i
+  const txt = cleanAddressText(line);
+  const m = (txt || '').match(
+    new RegExp(
+      `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*([A-Za-z][A-Za-z\\s]+),?\\s*([A-Za-z]{2}|[A-Za-z\\s]+)\\s+(\\d{5})(?:-\\d{4})?\\b`,
+      'i'
+    )
   );
   if (!m) return null;
   const state = normState(m[3]);
@@ -190,18 +208,21 @@ function parseFullAddress(line) {
     zip: m[4]
   };
 }
+
 function parseAddressLine1(text) {
-  const m = (text || '').match(
-    /\b(\d{2,8}\s+[A-Za-z0-9.\s,]+?(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way))\b/i
-  );
+  const txt = cleanAddressText(text);
+  const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
   return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
+
 function parseCityStateZip(text) {
-  const m = (text || '').match(/\b([A-Za-z][A-Za-z\s]+),\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/);
+  const txt = cleanAddressText(text);
+  const m = (txt || '').match(/\b([A-Za-z][A-Za-z\s]+),?\s*([A-Za-z]{2}|[A-Za-z\s]+)\s+(\d{5})(?:-\d{4})?\b/);
   if (!m) return null;
   const st = normState(m[2]);
   return { city: m[1].trim(), state: st || m[2].trim().toUpperCase(), zip: m[3] };
 }
+
 function parseThermostatSetpoint(text) {
   const t = (text || '').toLowerCase();
   const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
@@ -397,7 +418,6 @@ export default async function handler(req, res) {
 
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
-    // Never start in confirmation mode unless we explicitly set it later
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
 
     // --- Confirmation gate (after summary) ---
@@ -415,7 +435,7 @@ export default async function handler(req, res) {
           usage: null,
         });
       }
-      // if they say it's wrong, fall through to correction flows
+      // else fall through to corrections
     }
 
     // ---- Strict address capture (one-line only)
@@ -424,83 +444,6 @@ export default async function handler(req, res) {
       mergedSlots = addrProgress.slots;
       return res.status(200).json({
         reply: enforceHVACBranding(addrProgress.reply),
-        slots: mergedSlots,
-        done: false,
-        goodbye: null,
-        needs_confirmation: false,
-        model: 'gpt-4o-mini',
-        usage: null,
-      });
-    }
-
-    // ---- Pending fix flow (generic corrections)
-    if (mergedSlots.pending_fix) {
-      const pf = mergedSlots.pending_fix;
-      let applied = false;
-      let confirm = '';
-
-      const path = pf.field || '';
-      const setThermo = (key, val) => {
-        mergedSlots.thermostat = mergedSlots.thermostat || {};
-        mergedSlots.thermostat[key] = val;
-        applied = true;
-        confirm = `Okay — updating the ${key === 'current' ? 'current temperature' : 'thermostat setpoint'} to ${val}°.`;
-      };
-
-      if (path === 'thermostat.current') {
-        const val = parseThermostatCurrent(speech);
-        if (val !== null) setThermo('current', val);
-      } else if (path === 'thermostat.setpoint') {
-        const val = parseThermostatSetpoint(speech);
-        if (val !== null) setThermo('setpoint', val);
-      } else if (path === 'callback_number') {
-        const phone = parsePhone(speech);
-        if (phone?.complete) { mergedSlots.callback_number = phone.full; applied = true; confirm = `Got it — updating the callback number to ${phone.full}.`; }
-      } else if (path === 'service_address.line1') {
-        const line1 = parseAddressLine1(speech);
-        if (line1) { mergedSlots.service_address = mergedSlots.service_address || {}; mergedSlots.service_address.line1 = line1; applied = true; confirm = `Thanks — updating the street address to ${line1}.`; }
-      } else if (path === 'service_address.city_state_zip') {
-        const csz = parseCityStateZip(speech) || parseFullAddress(speech);
-        if (csz) {
-          mergedSlots.service_address = mergedSlots.service_address || {};
-          mergedSlots.service_address.city = csz.city;
-          mergedSlots.service_address.state = csz.state;
-          mergedSlots.service_address.zip = csz.zip;
-          applied = true;
-          confirm = `Thanks — updating city, state, and zip to ${csz.city}, ${csz.state} ${csz.zip}.`;
-        }
-      }
-
-      if (applied) {
-        mergedSlots.pending_fix = null;
-        mergedSlots.confirmation_pending = false;
-        return res.status(200).json({
-          reply: enforceHVACBranding(confirm + ' Anything else you’d like to adjust?'),
-          slots: mergedSlots,
-          done: false,
-          goodbye: null,
-          needs_confirmation: false,
-          model: 'gpt-4o-mini',
-          usage: null,
-        });
-      } else {
-        return res.status(200).json({
-          reply: enforceHVACBranding(pf.prompt || 'What should it be?'),
-          slots: mergedSlots,
-          done: false,
-          goodbye: null,
-          needs_confirmation: false,
-          model: 'gpt-4o-mini',
-          usage: null,
-        });
-      }
-    }
-
-    // ---- If caller says “let’s continue”, jump to next missing thing
-    if (wantsToContinue(speech)) {
-      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. Let’s schedule your visit.';
-      return res.status(200).json({
-        reply: enforceHVACBranding(prompt),
         slots: mergedSlots,
         done: false,
         goodbye: null,
