@@ -76,7 +76,8 @@ slots schema:
   "pending_fix": null | { "field": "<path>", "prompt": "<follow-up question>" },
   "confirmation_pending": null | true | false,
   "summary_reads": null | <number>,
-  "address_confirm_pending": null | true | false
+  "address_confirm_pending": null | true | false,
+  "callback_confirm_pending": null | true | false
 }
 
 Behavior
@@ -344,11 +345,12 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// Light empathy if caller mentions hot/no cool and reply lacks it
+// Empathy: broader trigger + require explicit "sorry/apologize"
 function addEmpathy(speech, reply) {
   const t = (speech || '').toLowerCase();
-  const problem = /\b(no (cool|cold|heat)|blowing hot|very hot|not blowing cold|unit.*down|not working)\b/.test(t);
-  if (problem && !/sorry|understand|apologize/i.test(reply)) {
+  const problem =
+    /\b(no (cool|cold|heat)|not (cooling|cold|working)|blowing (hot|warm)|very hot|unit.*(down|out)|ac (is )?(out|down|broke|broken|busted)|system (is )?(out|down|broken|broke))\b/.test(t);
+  if (problem && !/\b(sorry|apologiz)/i.test(reply)) {
     return `I’m sorry to hear that. ${reply}`;
   }
   return reply;
@@ -430,7 +432,7 @@ function handleAddressProgress_STRICT(speech, slots) {
   };
 }
 
-// ---- Phone progress: don’t store partials; confirm when complete
+// ---- Phone progress: accept full 10; set confirm gate; reject partial
 function handlePhoneProgress(speech, slots) {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
@@ -440,9 +442,10 @@ function handlePhoneProgress(speech, slots) {
 
   if (p.complete) {
     s.callback_number = p.full;
+    s.callback_confirm_pending = true;
     return {
       slots: s,
-      reply: `Thanks. I have your callback number as ${p.full}.`,
+      reply: `Thanks. I have your callback number as ${p.full}. Is that correct?`,
       handled: true
     };
   }
@@ -516,6 +519,86 @@ export default async function handler(req, res) {
       });
     }
 
+    // --- ADDRESS CONFIRMATION GATE ---
+    if (mergedSlots.address_confirm_pending === true) {
+      const addr = mergedSlots.service_address || {};
+      if (isAffirmation(speech) && !isNegation(speech)) {
+        mergedSlots.address_confirm_pending = false;
+        const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+        return res.status(200).json({
+          reply: enforceHVACBranding(prompt),
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      if (isNegation(speech)) {
+        mergedSlots.address_confirm_pending = false;
+        mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
+        return res.status(200).json({
+          reply: 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.',
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      return res.status(200).json({
+        reply: `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`,
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
+    // --- CALLBACK NUMBER CONFIRMATION GATE ---
+    if (mergedSlots.callback_confirm_pending === true) {
+      const n = mergedSlots.callback_number || '';
+      if (isAffirmation(speech) && !isNegation(speech)) {
+        mergedSlots.callback_confirm_pending = false;
+        const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+        return res.status(200).json({
+          reply: enforceHVACBranding(prompt),
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      if (isNegation(speech)) {
+        mergedSlots.callback_confirm_pending = false;
+        mergedSlots.callback_number = null;
+        return res.status(200).json({
+          reply: 'No problem—what’s the full 10-digit callback number?',
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      return res.status(200).json({
+        reply: `I have ${n} as your callback number. Is that correct? Please say yes or no.`,
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+
     // ---- Strict address capture (one-line only)
     const addrProgress = handleAddressProgress_STRICT(speech, mergedSlots);
     if (addrProgress.handled) {
@@ -547,7 +630,7 @@ export default async function handler(req, res) {
     }
 
     // ---- “let’s continue / move on” → next missing item (but not during gates)
-    if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && wantsToContinue(speech)) {
+    if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
         reply: enforceHVACBranding(prompt),
