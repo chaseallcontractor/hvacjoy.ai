@@ -185,82 +185,53 @@ function normState(s) {
   return abbr || null;
 }
 
-// --- NEW: make ASR-cleaning tolerant to “2 4 7, 8 …” and “Wok”→“Walk”
+// Normalize punctuation for address parsing (handles "2478. Kaley walk. …")
 function cleanAddressText(line = '') {
-  let out = String(line);
-
-  // Collapse spaced/comma-separated leading house numbers: "2 4 7, 8 " -> "2478 "
-  out = out.replace(/^\s*((?:\d[,\s]){1,7}\d)\s+/, (_, g1) => g1.replace(/[,\s]/g, '') + ' ');
-
-  // Normalize punctuation blobs and extra spaces
-  out = out
-    .replace(/(\d)\.(?=\s|$)/g, '$1')  // "2478." -> "2478"
-    .replace(/\s*\.\s*/g, ' ')         // "Wok. Kennesaw" -> "Wok Kennesaw"
+  return line
+    .replace(/(\d)\.(?=\s|$)/g, '$1')
+    .replace(/\s*\.\s*/g, ' ')
     .replace(/\s{2,}/g, ' ')
     .trim();
-
-  // Common ASR suffix fixups
-  out = out
-    .replace(/\bWok\b/gi, 'Walk')
-    .replace(/\bWlk\b/gi, 'Walk');
-
-  return out;
 }
-
 const STREET_SUFFIX =
   '(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way|Walk|Trail|Trl|Circle|Cir|Parkway|Pkwy|Place|Pl|Terrace|Ter|Trace|Pass|Path|Point|Pt|Loop|Run|Highway|Hwy|Cove|Cv)';
 
-// Try strict first; then a lenient fallback if city/state/zip are present.
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
 
-  // STRICT: requires known street suffix
+  // City non-greedy, word boundary before ZIP, then fallback path
   const re = new RegExp(
     `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
-    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
-    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
+    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +                    // city (non-greedy)
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +   // state (full or 2-letter)
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
+
   let m = txt.match(re);
   if (m) {
     const stateToken = m[3] || m[4];
     const state = normState(stateToken);
     if (!state) return null;
     return {
-      line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
+      line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
       city: m[2].trim(),
       state,
       zip: m[5]
     };
   }
 
-  // LENIENT: accept line1 without a recognized suffix if city/state/zip are present
-  const csz = parseCityStateZip(txt);
-  if (csz) {
-    // find where the city starts, and treat everything before it as line1
-    const idx = txt.toLowerCase().indexOf(csz.city.toLowerCase());
-    if (idx > 0) {
-      const prefix = txt.slice(0, idx).replace(/,\s*$/, '').trim();
-      const m2 = prefix.match(/\b(\d{2,8}\s+[A-Za-z0-9.\s,]+)$/);
-      if (m2) {
-        const line1 = m2[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
-        if (line1) return { line1, ...csz };
-      }
-    }
-  }
-
-  // Last resort: combine strict line1 + csz if both separately parse
+  // Fallback: combine line1 + city/state/zip parsed separately
   const line1 = parseAddressLine1(txt);
-  if (line1 && csz) return { line1: line1.replace(/,\s*/g, ' '), ...csz };
-
+  const csz = parseCityStateZip(txt);
+  if (line1 && csz) return { line1, ...csz };
   return null;
 }
 
 function parseAddressLine1(text) {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
-  return m ? m[1].trim() : null;
+  return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
 function parseCityStateZip(text = '') {
   const txt = cleanAddressText(text);
@@ -339,10 +310,6 @@ function nextMissingPrompt(s) {
   if (!s.full_name) return 'Can I have your full name?';
   if (!s.callback_number) return 'Great. What’s the best callback number?';
   if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
-    // If we heard city/state/zip but not line1, be specific
-    if (!addr.line1 && addr.city && addr.state && addr.zip) {
-      return `Thanks. What’s the street line with number and suffix, for example: 2478 Kaley Walk?`;
-    }
     return 'Please say the full service address in one sentence, including street, city, state, and zip.';
   }
   if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
@@ -355,6 +322,7 @@ function nextMissingPrompt(s) {
   return null;
 }
 
+// ---- Repeat guard for time window question
 function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   if (!lastQ || !newQ) return { newReply: null, updated: false };
   if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
@@ -369,6 +337,7 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   return { newReply: null, updated: false };
 }
 
+// Suppress pricing repeats after it’s been disclosed
 function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
     return 'Great—thanks for confirming. Let’s get your visit on the calendar.';
@@ -376,15 +345,11 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// --- Empathy (broad)
+// Empathy: broader trigger + require explicit "sorry/apologize"
 function addEmpathy(speech, reply) {
   const t = (speech || '').toLowerCase();
-  const neg = "(?:not|isn['’]?t|doesn['’]?t|didn['’]?t|won['’]?t|cant|can['’]?t|cannot|aren['’]?t|ain['’]?t)";
-  const problemRe = new RegExp(
-    `\\b(?:no\\s+(?:cool|cold|heat)|${neg}\\s+(?:cooling|cool|cold|heating|working|turn(?:ing)?\\s*on)|blowing\\s+(?:hot|warm)|very\\s+hot|unit\\s*(?:is\\s*)?(?:down|out)|ac\\s*(?:is\\s*)?(?:out|down|broke|broken|busted|dead)|system\\s*(?:is\\s*)?(?:out|down|broken|broke|dead))\\b`
-    ,'i'
-  );
-  const problem = problemRe.test(t);
+  const problem =
+    /\b(no (cool|cold|heat)|not (cooling|cold|working)|blowing (hot|warm)|very hot|unit.*(down|out)|ac (is )?(out|down|broke|broken|busted)|system (is )?(out|down|broken|broke))\b/.test(t);
   if (problem && !/\b(sorry|apologiz)/i.test(reply)) {
     return `I’m sorry to hear that. ${reply}`;
   }
@@ -393,12 +358,13 @@ function addEmpathy(speech, reply) {
 
 // quick yes/no helpers
 function isAffirmation(text='') {
-  return /\b(yes|yep|yeah|correct|true|the truth|that'?s (right|correct|true)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
+  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
 }
 function isNegation(text='') {
   return /\b(no|nope|nah|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
 }
 
+// Summary helper
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
@@ -436,7 +402,7 @@ function serverSideDoneCheck(slots) {
   );
 }
 
-// ---- Address progress (strict first, then targeted follow-up)
+// ---- Address progress: accept ONLY a complete, one-line address
 function handleAddressProgress_STRICT(speech, slots) {
   const s = { ...(slots || {}) };
 
@@ -459,17 +425,6 @@ function handleAddressProgress_STRICT(speech, slots) {
     };
   }
 
-  // If we can at least parse city/state/zip, ask only for the street line
-  const csz = parseCityStateZip(speech);
-  if (csz) {
-    s.service_address = { ...(s.service_address || {}), ...csz, line1: null };
-    return {
-      slots: s,
-      reply: `Thanks. I have ${csz.city}, ${csz.state} ${csz.zip}. What’s the street line with number and suffix, for example: 2478 Kaley Walk?`,
-      handled: true
-    };
-  }
-
   return {
     slots: s,
     reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 123 Main Street, Washington, DC 10001.',
@@ -477,42 +432,30 @@ function handleAddressProgress_STRICT(speech, slots) {
   };
 }
 
-// ---- Phone progress
-function handlePhoneProgress(speech, slots, lastQuestion = '') {
+// ---- Phone progress: accept full 10; set confirm gate; reject partial
+function handlePhoneProgress(speech, slots) {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
 
   const p = parsePhone(speech);
   if (!p) return { slots: s, reply: null, handled: false };
 
-  const askedForPhone = /\b(callback|best (phone|number)|phone number|callback number)\b/i.test(lastQuestion || '');
-
-  if (p.complete || askedForPhone) {
-    if (p.complete) {
-      s.callback_number = p.full;
-      s.callback_confirm_pending = true;
-      return {
-        slots: s,
-        reply: `Thanks. I have your callback number as ${p.full}. Is that correct?`,
-        handled: true
-      };
-    }
+  if (p.complete) {
+    s.callback_number = p.full;
+    s.callback_confirm_pending = true;
     return {
       slots: s,
-      reply: 'I heard the beginning. What’s the full 10-digit callback number?',
+      reply: `Thanks. I have your callback number as ${p.full}. Is that correct?`,
       handled: true
     };
   }
-  return { slots: s, reply: null, handled: false };
-}
 
-// --- Never allow the model to flip internal control flags
-function sanitizeModelSlots(sl) {
-  const s = { ...(sl || {}) };
-  delete s.confirmation_pending;
-  delete s.address_confirm_pending;
-  delete s.callback_confirm_pending;
-  return s;
+  // partial
+  return {
+    slots: s,
+    reply: 'I heard the beginning. What’s the full 10-digit callback number?',
+    handled: true
+  };
 }
 
 export default async function handler(req, res) {
@@ -534,9 +477,6 @@ export default async function handler(req, res) {
     let mergedSlots = { ...(lastSlots || {}) };
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
-
-    const priorLastQuestion = getLastAssistantQuestion(history) || '';
-    const effectiveLastQ = lastQuestion || priorLastQuestion;
 
     // --- FINAL CONFIRMATION GATE ---
     if (mergedSlots.confirmation_pending === true) {
@@ -567,6 +507,7 @@ export default async function handler(req, res) {
         });
       }
 
+      // Unclear → ask for explicit yes/no or change
       return res.status(200).json({
         reply: "If everything is correct, please say “yes.” Otherwise, tell me what to change.",
         slots: mergedSlots,
@@ -585,7 +526,7 @@ export default async function handler(req, res) {
         mergedSlots.address_confirm_pending = false;
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding(addEmpathy(speech, prompt)),
+          reply: enforceHVACBranding(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -595,25 +536,10 @@ export default async function handler(req, res) {
         });
       }
       if (isNegation(speech)) {
-        const corrected = parseFullAddress(speech);
-        if (corrected) {
-          mergedSlots.address_confirm_pending = true;
-          mergedSlots.service_address = { ...(mergedSlots.service_address||{}), ...corrected };
-          const text = `Sorry about that—thank you. I have ${corrected.line1}, ${corrected.city}, ${corrected.state} ${corrected.zip}. Is that correct?`;
-          return res.status(200).json({
-            reply: enforceHVACBranding(addEmpathy(speech, text)),
-            slots: mergedSlots,
-            done: false,
-            goodbye: null,
-            needs_confirmation: false,
-            model: 'gpt-4o-mini',
-            usage: null,
-          });
-        }
         mergedSlots.address_confirm_pending = false;
         mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
         return res.status(200).json({
-          reply: enforceHVACBranding(addEmpathy(speech, 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.')),
+          reply: 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.',
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -623,10 +549,7 @@ export default async function handler(req, res) {
         });
       }
       return res.status(200).json({
-        reply: enforceHVACBranding(addEmpathy(
-          speech,
-          `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`
-        )),
+        reply: `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`,
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -643,7 +566,7 @@ export default async function handler(req, res) {
         mergedSlots.callback_confirm_pending = false;
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding(addEmpathy(speech, prompt)),
+          reply: enforceHVACBranding(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -656,7 +579,7 @@ export default async function handler(req, res) {
         mergedSlots.callback_confirm_pending = false;
         mergedSlots.callback_number = null;
         return res.status(200).json({
-          reply: enforceHVACBranding(addEmpathy(speech, 'No problem—what’s the full 10-digit callback number?')),
+          reply: 'No problem—what’s the full 10-digit callback number?',
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -666,7 +589,7 @@ export default async function handler(req, res) {
         });
       }
       return res.status(200).json({
-        reply: enforceHVACBranding(addEmpathy(speech, `I have ${n} as your callback number. Is that correct? Please say yes or no.`)),
+        reply: `I have ${n} as your callback number. Is that correct? Please say yes or no.`,
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -676,13 +599,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Strict address capture with lenient fallback
+    // ---- Strict address capture (one-line only)
     const addrProgress = handleAddressProgress_STRICT(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
-      const empathetic = addEmpathy(speech, addrProgress.reply);
       return res.status(200).json({
-        reply: enforceHVACBranding(empathetic),
+        reply: enforceHVACBranding(addrProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -692,13 +614,12 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Phone progress
-    const phoneProgress = handlePhoneProgress(speech, mergedSlots, effectiveLastQ);
+    // ---- Phone progress (accept full 10; reject partial)
+    const phoneProgress = handlePhoneProgress(speech, mergedSlots);
     if (phoneProgress.handled) {
       mergedSlots = phoneProgress.slots;
-      const empathetic = addEmpathy(speech, phoneProgress.reply);
       return res.status(200).json({
-        reply: enforceHVACBranding(empathetic),
+        reply: enforceHVACBranding(phoneProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -708,11 +629,11 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- “continue / move on”
+    // ---- “let’s continue / move on” → next missing item (but not during gates)
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
-        reply: enforceHVACBranding(addEmpathy(speech, prompt)),
+        reply: enforceHVACBranding(prompt),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -722,27 +643,29 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Normal LLM step
-    const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
-    const t = withTimeout(OPENAI_TIMEOUT_MS);
+    // ---- Normal LLM step ---------------------------------------------------
+    const priorLastQuestion = getLastAssistantQuestion(history) || '';
+    const lastQ = lastQuestion || priorLastQuestion;
+
+    const steering =
+      'Continue the call. Do not repeat the greeting.' +
+      '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
+      '\nRequire a date for booking. Ask for date first, then time window.' +
+      '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
+      '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
+      (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
+      '\nKnown slots (do not re-ask if non-null):\n' +
+      JSON.stringify(mergedSlots || {}, null, 2);
 
     const messages = [
       { role: 'system', content: SYSTEM_PROMPT },
       ...history,
-      {
-        role: 'assistant',
-        content:
-          'Continue the call. Do not repeat the greeting.' +
-          '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
-          '\nRequire a date for booking. Ask for date first, then time window.' +
-          '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
-          '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
-          (effectiveLastQ ? `\nLast question you asked was:\n"${effectiveLastQ}"` : '') +
-          '\nKnown slots (do not re-ask if non-null):\n' +
-          JSON.stringify(mergedSlots || {}, null, 2)
-      },
+      { role: 'assistant', content: steering },
       { role: 'user', content: speech }
     ];
+
+    const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
+    const t = withTimeout(OPENAI_TIMEOUT_MS);
 
     const resp = await fetch('https://api.openai.com/v1/chat/completions', {
       method: 'POST',
@@ -763,11 +686,13 @@ export default async function handler(req, res) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: enforceHVACBranding(addEmpathy(speech, 'Thanks. Please say the full service address in one sentence, including street, city, state, and zip.')),
+        reply: enforceHVACBranding('Thanks. Please say the full service address in one sentence, including street, city, state, and zip.'),
         slots: mergedSlots,
         done: false,
         goodbye: null,
         needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
       });
     }
 
@@ -789,12 +714,12 @@ export default async function handler(req, res) {
     if (typeof parsed.reply !== 'string') {
       parsed.reply = 'Thanks. What’s the next detail—your full service address with city, state, and zip?';
     }
-    const safeModelSlots = sanitizeModelSlots(parsed.slots);
+    if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
-    const wasConfirmGate = mergedSlots.confirmation_pending === true;
-    mergedSlots = mergeSlots(mergedSlots, safeModelSlots);
-    if (!wasConfirmGate) mergedSlots.confirmation_pending = false;
+    // merge with old slots
+    mergedSlots = mergeSlots(mergedSlots, parsed.slots);
 
+    // heuristics
     if (!mergedSlots.preferred_window) {
       const win = inferPreferredWindowFrom(speech);
       if (win) mergedSlots.preferred_window = win;
@@ -809,41 +734,49 @@ export default async function handler(req, res) {
       }
     }
     {
+      // Only infer call-ahead when the last asked question was about call-ahead
       const inferred = inferYesNoCallAhead(speech);
-      if (inferred !== null && /call[- ]ahead/i.test(effectiveLastQ || '')) {
+      if (inferred !== null && /call[- ]ahead/i.test(lastQ || '')) {
         mergedSlots.call_ahead = inferred;
       }
     }
 
+    // If the model tries to schedule before price disclosure, force the price line
     if (mergedSlots.pricing_disclosed !== true &&
         /(?:schedule|book|calendar|what day works|time window|morning|afternoon)/i.test(parsed.reply || '')) {
       parsed.reply = 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
     }
 
-    const guard = sameQuestionRepeatGuard(effectiveLastQ, parsed.reply, speech, mergedSlots);
+    // Time-window repeat guard
+    const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
 
+    // Prevent repeated thermostat question if both values are present
     if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
         (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
       parsed.reply = 'Great—thanks. Our diagnostic visit is $50 per non-working unit. What day works for your visit?';
     }
 
+    // If the model says "schedule" but we’re missing required pieces, push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
       const prompt = nextMissingPrompt(mergedSlots);
       if (prompt) parsed.reply = prompt;
     }
 
+    // Final cleanups
     parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
     parsed.reply = suppressMembershipUntilBooked(parsed.reply, mergedSlots);
     parsed.reply = addEmpathy(speech, parsed.reply);
     parsed.reply = stripRepeatedGreeting(history, parsed.reply);
     parsed.reply = enforceHVACBranding(parsed.reply);
 
+    // done?
     const serverDone = serverSideDoneCheck(mergedSlots);
 
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
+      // Only read the summary the first time we reach done
       if ((mergedSlots.summary_reads || 0) < 1) {
         replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
         mergedSlots.summary_reads = (mergedSlots.summary_reads || 0) + 1;
@@ -868,7 +801,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply: enforceHVACBranding(addEmpathy(speech, "I caught that. When you’re ready, please say the full service address in one sentence, including street, city, state, and zip.")),
+      reply: enforceHVACBranding("I caught that. When you’re ready, please say the full service address in one sentence, including street, city, state, and zip."),
       slots: (req.body && req.body.lastSlots) || {},
       done: false,
       goodbye: null,
