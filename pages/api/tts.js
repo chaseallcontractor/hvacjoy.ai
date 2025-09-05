@@ -8,19 +8,45 @@ export const config = {
   },
 };
 
-// Match your Render env var names exactly:
-const ELEVEN_KEY = process.env.ELEVEN_LABS_API_KEY;   // e.g. sk_...
-const VOICE_ID   = process.env.ELEVENLABS_VOICE_ID;   // e.g. 21m00Tcm4TlvDq8ikWAM
+// Prefer the standardized names, but support legacy ones for compatibility
+const ELEVEN_KEY =
+  process.env.ELEVEN_API_KEY ||
+  process.env.ELEVEN_LABS_API_KEY || // legacy
+  '';
+
+const DEFAULT_VOICE_ID =
+  process.env.ELEVEN_VOICE_ID ||
+  process.env.ELEVENLABS_VOICE_ID || // legacy
+  process.env.TTS_VOICE || // optional global override
+  '';
+
+function pickVoiceId(req) {
+  // Accept both ?voice= and ?voiceId=
+  const qp = req.query || {};
+  const qVoice = (qp.voice ?? qp.voiceId ?? '').toString().trim();
+  return qVoice || DEFAULT_VOICE_ID;
+}
 
 export default async function handler(req, res) {
   try {
+    if (req.method !== 'GET') {
+      res.setHeader('Allow', 'GET');
+      return res.status(405).json({ error: 'Method Not Allowed' });
+    }
+
     // text from query; cap length to keep latency reasonable
-    const text = String(req.query.text || '').slice(0, 800);
-    // allow override via ?voiceId=... but default to env
-    const voiceId = String(req.query.voiceId || VOICE_ID || '').trim();
+    const text = (req.query?.text ?? '').toString().slice(0, 1200);
+    const voiceId = pickVoiceId(req);
 
     if (!text || !voiceId || !ELEVEN_KEY) {
-      return res.status(400).json({ error: 'Missing text, voiceId, or API key' });
+      return res.status(400).json({
+        error: 'Missing text, voiceId, or API key',
+        have: {
+          text: Boolean(text),
+          voiceId: Boolean(voiceId),
+          apiKey: Boolean(ELEVEN_KEY),
+        },
+      });
     }
 
     const elevenUrl =
