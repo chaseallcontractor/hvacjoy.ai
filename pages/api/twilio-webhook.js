@@ -16,9 +16,10 @@ function baseUrlFromReq(req) {
   return `${proto}://${host}`;
 }
 
+// used by <Play> everywhere, including the intro now
 function ttsUrlAbsolute(baseUrl, text, voice) {
   const params = new URLSearchParams({ text });
-  if (voice) params.set('voice', voice);
+  if (voice) params.set('voice', voice); // optional; your /api/tts can read a default
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
@@ -44,19 +45,26 @@ function withTimeout(ms) {
 
 // ---------- Anti-restart guard ----------
 async function introAlreadyPlayed(supabase, callSid) {
-  // If no CallSid, play safe and DO NOT replay
+  // Fail-safe: if we don't have a callSid, assume intro already played (never replay)
   if (!callSid) return true;
   try {
     const { data } = await supabase
       .from('call_transcripts')
-      .select('turn_index')
+      .select('role, meta, text, turn_index')
       .eq('call_sid', callSid)
-      .limit(1);
-    // If *anything* is logged for this CallSid, treat intro as played
-    return Array.isArray(data) && data.length > 0;
-  } catch (_) {
-    return true; // fail-safe: never replay intro
-  }
+      .order('turn_index', { ascending: false })
+      .limit(30);
+
+    let seenAssistant = false;
+    for (const row of (data || [])) {
+      if (row.role === 'assistant') {
+        seenAssistant = true;
+        if (row?.meta?.type === 'intro') return true;
+        if (/(^|\s)welcome to h\.?\s*v\.?\s*a\.?\s*c/i.test(row.text || '')) return true;
+      }
+    }
+    return seenAssistant; // if any assistant line exists, don’t re-intro
+  } catch (_) { return true; } // fail-safe: never replay intro
 }
 
 async function getLastAssistantQuestion(supabase, callSid) {
@@ -70,7 +78,7 @@ async function getLastAssistantQuestion(supabase, callSid) {
 
     for (const row of (data || [])) {
       if (row.role !== 'assistant') continue;
-      if (row?.meta?.type === 'intro') continue;
+      if (row?.meta?.type === 'intro') continue; // skip intros
       if (row?.meta?.last_question) return String(row.meta.last_question);
       const t = (row.text || '').trim();
       if (t.endsWith('?')) return t;
@@ -146,6 +154,7 @@ export default async function handler(req, res) {
   // First/noisy turn handling
   if ((!speech || isUnclear(speech)) && !userSaysWeAreScheduling(speech)) {
     if (!introPlayed) {
+      // 1) Log readable text (transcript)
       const introDisplay =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const example =
@@ -153,15 +162,14 @@ export default async function handler(req, res) {
 
       await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
+      // 2) Speak the intro + example with your selected TTS voice
+      const welcome = 'Welcome to H. V. A. C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+      const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome);               // uses your /api/tts voice
       const exampleUrl = ttsUrlAbsolute(baseUrl, example);
 
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
-  <Say voice="Polly.Joanna" language="en-US">
-    Welcome to <say-as interpret-as="characters">HVAC</say-as> Joy. 
-    To ensure the highest quality service, this call may be recorded and monitored. 
-    How can I help today?
-  </Say>
+  <Play>${welcomeUrl}</Play>
   <Pause length="1"/>
   <Play>${exampleUrl}</Play>
   <Pause length="1"/>
@@ -201,11 +209,13 @@ export default async function handler(req, res) {
         .order('turn_index', { ascending: false })
         .limit(12);
 
+      // Prefer the most recent assistant turn WITH slots (skip intro-only turns)
       const lastAssistantWithSlots = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.slots
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
+      // Prefer a last_question that isn't an intro
       const lastAssistantWithQMeta = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.last_question && t?.meta?.type !== 'intro'
       );
