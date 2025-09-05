@@ -185,18 +185,36 @@ function normState(s) {
   return abbr || null;
 }
 
+// --- NEW: make ASR-cleaning tolerant to “2 4 7, 8 …” and “Wok”→“Walk”
 function cleanAddressText(line = '') {
-  return line
-    .replace(/(\d)\.(?=\s|$)/g, '$1')
-    .replace(/\s*\.\s*/g, ' ')
+  let out = String(line);
+
+  // Collapse spaced/comma-separated leading house numbers: "2 4 7, 8 " -> "2478 "
+  out = out.replace(/^\s*((?:\d[,\s]){1,7}\d)\s+/, (_, g1) => g1.replace(/[,\s]/g, '') + ' ');
+
+  // Normalize punctuation blobs and extra spaces
+  out = out
+    .replace(/(\d)\.(?=\s|$)/g, '$1')  // "2478." -> "2478"
+    .replace(/\s*\.\s*/g, ' ')         // "Wok. Kennesaw" -> "Wok Kennesaw"
     .replace(/\s{2,}/g, ' ')
     .trim();
+
+  // Common ASR suffix fixups
+  out = out
+    .replace(/\bWok\b/gi, 'Walk')
+    .replace(/\bWlk\b/gi, 'Walk');
+
+  return out;
 }
+
 const STREET_SUFFIX =
   '(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way|Walk|Trail|Trl|Circle|Cir|Parkway|Pkwy|Place|Pl|Terrace|Ter|Trace|Pass|Path|Point|Pt|Loop|Run|Highway|Hwy|Cove|Cv)';
 
+// Try strict first; then a lenient fallback if city/state/zip are present.
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
+
+  // STRICT: requires known street suffix
   const re = new RegExp(
     `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
@@ -204,7 +222,6 @@ function parseFullAddress(line) {
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
-
   let m = txt.match(re);
   if (m) {
     const stateToken = m[3] || m[4];
@@ -218,9 +235,25 @@ function parseFullAddress(line) {
     };
   }
 
-  const line1 = parseAddressLine1(txt);
+  // LENIENT: accept line1 without a recognized suffix if city/state/zip are present
   const csz = parseCityStateZip(txt);
+  if (csz) {
+    // find where the city starts, and treat everything before it as line1
+    const idx = txt.toLowerCase().indexOf(csz.city.toLowerCase());
+    if (idx > 0) {
+      const prefix = txt.slice(0, idx).replace(/,\s*$/, '').trim();
+      const m2 = prefix.match(/\b(\d{2,8}\s+[A-Za-z0-9.\s,]+)$/);
+      if (m2) {
+        const line1 = m2[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        if (line1) return { line1, ...csz };
+      }
+    }
+  }
+
+  // Last resort: combine strict line1 + csz if both separately parse
+  const line1 = parseAddressLine1(txt);
   if (line1 && csz) return { line1: line1.replace(/,\s*/g, ' '), ...csz };
+
   return null;
 }
 
@@ -306,6 +339,10 @@ function nextMissingPrompt(s) {
   if (!s.full_name) return 'Can I have your full name?';
   if (!s.callback_number) return 'Great. What’s the best callback number?';
   if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
+    // If we heard city/state/zip but not line1, be specific
+    if (!addr.line1 && addr.city && addr.state && addr.zip) {
+      return `Thanks. What’s the street line with number and suffix, for example: 2478 Kaley Walk?`;
+    }
     return 'Please say the full service address in one sentence, including street, city, state, and zip.';
   }
   if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
@@ -339,7 +376,7 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// --- Empathy: broaden to handle “isn’t working / doesn’t work / won’t turn on”
+// --- Empathy (broad)
 function addEmpathy(speech, reply) {
   const t = (speech || '').toLowerCase();
   const neg = "(?:not|isn['’]?t|doesn['’]?t|didn['’]?t|won['’]?t|cant|can['’]?t|cannot|aren['’]?t|ain['’]?t)";
@@ -354,7 +391,7 @@ function addEmpathy(speech, reply) {
   return reply;
 }
 
-// quick yes/no helpers (accept STT oddities like “the truth”)
+// quick yes/no helpers
 function isAffirmation(text='') {
   return /\b(yes|yep|yeah|correct|true|the truth|that'?s (right|correct|true)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
 }
@@ -399,7 +436,7 @@ function serverSideDoneCheck(slots) {
   );
 }
 
-// ---- Address progress: accept ONLY a complete, one-line address
+// ---- Address progress (strict first, then targeted follow-up)
 function handleAddressProgress_STRICT(speech, slots) {
   const s = { ...(slots || {}) };
 
@@ -422,6 +459,17 @@ function handleAddressProgress_STRICT(speech, slots) {
     };
   }
 
+  // If we can at least parse city/state/zip, ask only for the street line
+  const csz = parseCityStateZip(speech);
+  if (csz) {
+    s.service_address = { ...(s.service_address || {}), ...csz, line1: null };
+    return {
+      slots: s,
+      reply: `Thanks. I have ${csz.city}, ${csz.state} ${csz.zip}. What’s the street line with number and suffix, for example: 2478 Kaley Walk?`,
+      handled: true
+    };
+  }
+
   return {
     slots: s,
     reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 123 Main Street, Washington, DC 10001.',
@@ -429,7 +477,7 @@ function handleAddressProgress_STRICT(speech, slots) {
   };
 }
 
-// ---- Phone progress: accept full 10; set confirm gate; reject partial unless phone was asked
+// ---- Phone progress
 function handlePhoneProgress(speech, slots, lastQuestion = '') {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
@@ -455,8 +503,6 @@ function handlePhoneProgress(speech, slots, lastQuestion = '') {
       handled: true
     };
   }
-
-  // We did NOT ask for phone and it’s not a complete 10 digits: ignore (prevents ZIP/house # collisions)
   return { slots: s, reply: null, handled: false };
 }
 
@@ -630,7 +676,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Strict address capture (one-line only)
+    // ---- Strict address capture with lenient fallback
     const addrProgress = handleAddressProgress_STRICT(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
@@ -646,7 +692,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Phone progress (accept full 10; ignore partials unless we asked)
+    // ---- Phone progress
     const phoneProgress = handlePhoneProgress(speech, mergedSlots, effectiveLastQ);
     if (phoneProgress.handled) {
       mergedSlots = phoneProgress.slots;
@@ -662,7 +708,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- “let’s continue / move on” → next missing item (but not during gates)
+    // ---- “continue / move on”
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
@@ -676,7 +722,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Normal LLM step ---------------------------------------------------
+    // ---- Normal LLM step
     const OPENAI_TIMEOUT_MS = parseInt(process.env.OPENAI_TIMEOUT_MS || '15000', 10);
     const t = withTimeout(OPENAI_TIMEOUT_MS);
 
@@ -722,8 +768,6 @@ export default async function handler(req, res) {
         done: false,
         goodbye: null,
         needs_confirmation: false,
-        model: 'gpt-4o-mini',
-        usage: null,
       });
     }
 
@@ -747,16 +791,10 @@ export default async function handler(req, res) {
     }
     const safeModelSlots = sanitizeModelSlots(parsed.slots);
 
-    // Preserve current confirmation gate; the model must not turn it on.
     const wasConfirmGate = mergedSlots.confirmation_pending === true;
-
-    // merge with old slots
     mergedSlots = mergeSlots(mergedSlots, safeModelSlots);
-
-    // If the model tried to sneak in a confirmation gate, reset it.
     if (!wasConfirmGate) mergedSlots.confirmation_pending = false;
 
-    // heuristics
     if (!mergedSlots.preferred_window) {
       const win = inferPreferredWindowFrom(speech);
       if (win) mergedSlots.preferred_window = win;

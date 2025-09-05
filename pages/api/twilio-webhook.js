@@ -16,7 +16,6 @@ function baseUrlFromReq(req) {
   return `${proto}://${host}`;
 }
 
-// used by <Play> everywhere else; intro won’t use this anymore
 function ttsUrlAbsolute(baseUrl, text, voice) {
   const params = new URLSearchParams({ text });
   if (voice) params.set('voice', voice);
@@ -71,7 +70,7 @@ async function getLastAssistantQuestion(supabase, callSid) {
 
     for (const row of (data || [])) {
       if (row.role !== 'assistant') continue;
-      if (row?.meta?.type === 'intro') continue; // skip intros
+      if (row?.meta?.type === 'intro') continue;
       if (row?.meta?.last_question) return String(row.meta.last_question);
       const t = (row.text || '').trim();
       if (t.endsWith('?')) return t;
@@ -147,7 +146,6 @@ export default async function handler(req, res) {
   // First/noisy turn handling
   if ((!speech || isUnclear(speech)) && !userSaysWeAreScheduling(speech)) {
     if (!introPlayed) {
-      // 1) Log readable text
       const introDisplay =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const example =
@@ -155,7 +153,6 @@ export default async function handler(req, res) {
 
       await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
-      // 2) Speak example prompt
       const exampleUrl = ttsUrlAbsolute(baseUrl, example);
 
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -204,13 +201,11 @@ export default async function handler(req, res) {
         .order('turn_index', { ascending: false })
         .limit(12);
 
-      // Prefer the most recent assistant turn WITH slots (skip intro-only turns)
       const lastAssistantWithSlots = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.slots
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
-      // Prefer a last_question that isn't an intro
       const lastAssistantWithQMeta = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.last_question && t?.meta?.type !== 'intro'
       );
