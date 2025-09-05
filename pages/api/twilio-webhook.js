@@ -22,7 +22,7 @@ function baseUrlFromReq(req) {
 // Used by <Play> everywhere (intro included)
 function ttsUrlAbsolute(baseUrl, text, voice) {
   const params = new URLSearchParams({ text });
-  if (voice) params.set('voice', voice); // your /api/tts can also default
+  if (voice) params.set('voice', voice); // /api/tts can also default
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
@@ -126,9 +126,8 @@ function normalizeCallAheadInText(text = '', slots = {}) {
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
   if (/\bno problem\b/.test(t)) return false; // avoid “no problem”
-  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac))/i.test(t);
+  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac)|\bvery (hot|cold)\b|burning up|freezing)/i.test(t);
 }
-
 function maybeAddEmpathyOnFallback(userText, reply) {
   if (detectedProblem(userText) && !/sorry|apologiz/i.test(reply)) {
     return `I’m sorry to hear that. ${reply}`;
@@ -138,7 +137,7 @@ function maybeAddEmpathyOnFallback(userText, reply) {
 
 // Common <Gather> attributes
 function gatherAttrs(actionUrl) {
-  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, A through Z" profanityFilter="false"`;
+  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
 }
 
 // ---------- Handler ----------

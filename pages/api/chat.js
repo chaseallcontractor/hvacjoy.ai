@@ -173,7 +173,35 @@ function getLastAssistantQuestion(history) {
   return null;
 }
 
-// ----------------- Parsing helpers ------------------
+// ----------------- Address parsing support ------------------
+
+// Normalize “one two three four …” (and “oh/o”=0) at the **start** of the line.
+function normalizeLeadingNumberWords(s = '') {
+  if (!s) return s;
+  const map = {
+    zero: '0', oh: '0', o: '0',
+    one: '1', two: '2', three: '3', four: '4', five: '5',
+    six: '6', seven: '7', eight: '8', nine: '9'
+  };
+  // strip filler words the ASR sometimes inserts
+  let text = s.replace(/\b(comma|period|dot|dash|hyphen)\b/gi, ' ');
+  // scan tokens from the start until a non-number token
+  const tokens = text.split(/[\s,.-]+/);
+  let i = 0, digits = '';
+  while (i < tokens.length) {
+    const t = (tokens[i] || '').toLowerCase();
+    if (t in map) { digits += map[t]; i++; continue; }
+    if (/^\d+$/.test(t)) { digits += t; i++; continue; }
+    if (t === 'and') { i++; continue; } // ignore “and”
+    break;
+  }
+  if (digits.length >= 1) {
+    const rest = tokens.slice(i).join(' ');
+    return `${digits} ${rest}`.trim();
+  }
+  return text;
+}
+
 const STATE_MAP = {
   alabama:'AL', alaska:'AK', arizona:'AZ', arkansas:'AR', california:'CA', colorado:'CO',
   connecticut:'CT', delaware:'DE', 'district of columbia':'DC', florida:'FL', georgia:'GA',
@@ -200,34 +228,38 @@ function normState(s) {
   return abbr || null;
 }
 
+// Normalize punctuation & spelled numbers for address parsing
 function cleanAddressText(line = '') {
-  return line
-    .replace(/(\d)\.(?=\s|$)/g, '$1')
-    .replace(/\s*\.\s*/g, ' ')
-    .replace(/\s{2,}/g, ' ')
-    .trim();
+  if (!line) return '';
+  return normalizeLeadingNumberWords(
+    line
+      .replace(/(\d)\.(?=\s|$)/g, '$1')   // "2478." -> "2478"
+      .replace(/\s*\.\s*/g, ' ')          // ". " -> " "
+      .replace(/\s{2,}/g, ' ')            // collapse spaces
+      .trim()
+  );
 }
+
 const STREET_SUFFIX =
   '(?:Street|St|Drive|Dr|Road|Rd|Avenue|Ave|Boulevard|Blvd|Lane|Ln|Court|Ct|Way|Walk|Trail|Trl|Circle|Cir|Parkway|Pkwy|Place|Pl|Terrace|Ter|Trace|Pass|Path|Point|Pt|Loop|Run|Highway|Hwy|Cove|Cv)';
 
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
 
-  const re = new RegExp(
-    `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
+  // Primary: require a known street suffix (highest precision)
+  let re = new RegExp(
+    `\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
     `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
-
   let m = txt.match(re);
   if (m) {
     const stateToken = m[3] || m[4];
     const state = normState(stateToken);
     if (!state) return null;
     return {
-      // remove stray commas within street name for cleaner TTS/readback
       line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
       city: m[2].trim(),
       state,
@@ -235,6 +267,28 @@ function parseFullAddress(line) {
     };
   }
 
+  // Fallback: **no street-suffix requirement** (handles ASR “Wok” vs “Walk”)
+  re = new RegExp(
+    `\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?)\\b[, ]+\\s*` +
+    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
+    `(\\d{5})(?:-\\d{4})?\\b`,
+    'i'
+  );
+  m = txt.match(re);
+  if (m) {
+    const stateToken = m[3] || m[4];
+    const state = normState(stateToken);
+    if (!state) return null;
+    return {
+      line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
+      city: m[2].trim(),
+      state,
+      zip: m[5]
+    };
+  }
+
+  // Last resort: parse parts separately
   const line1 = parseAddressLine1(txt);
   const csz = parseCityStateZip(txt);
   if (line1 && csz) return { line1: line1.replace(/,\s*/g, ' ').trim(), ...csz };
@@ -243,7 +297,7 @@ function parseFullAddress(line) {
 
 function parseAddressLine1(text) {
   const txt = cleanAddressText(text);
-  const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
+  const m = (txt || '').match(new RegExp(`\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
   return m ? m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
 function parseCityStateZip(text = '') {
@@ -262,25 +316,7 @@ function parseCityStateZip(text = '') {
   const zip = m[4];
   return { city, state, zip };
 }
-function parseThermostatSetpoint(text) {
-  const t = (text || '').toLowerCase();
-  const twoNums = t.match(/\b(\d{1,3})\b.*\bnot\b.*\b(\d{1,3})\b/) || t.match(/\bnot\b.*\b(\d{1,3})\b.*\b(\d{1,3})\b/);
-  if (twoNums) {
-    const a = parseInt(twoNums[1], 10);
-    const b = parseInt(twoNums[2], 10);
-    if (!Number.isNaN(a) && !Number.isNaN(b)) return Math.max(a, b);
-  }
-  const direct = t.match(/\b(set\s*point|setpoint|thermostat)\b.*\b(is|at)\b[^0-9]*?(\d{1,3})\b/);
-  if (direct) {
-    const val = parseInt(direct[3], 10);
-    if (!Number.isNaN(val)) return val;
-  }
-  return null;
-}
-function parseThermostatCurrent(text) {
-  const m = (text || '').match(/\b(?:current|now|reading)\b[^0-9]*?(\d{1,3})\b/i);
-  return m ? parseInt(m[1], 10) : null;
-}
+
 function parsePhone(text) {
   const digits = (text || '').replace(/\D+/g, '');
   if (digits.length >= 10) {
@@ -290,17 +326,12 @@ function parsePhone(text) {
   if (digits.length >= 6) return { partial: digits, complete: false };
   return null;
 }
-function parseUnitCount(text) {
-  const m = (text || '').match(/\b(\d+)\s*(?:unit|units|ac|systems?)\b/i);
-  if (m) return parseInt(m[1], 10);
-  return null;
-}
 
 // ----------------- Detectors & cleaners ------------------
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
   if (/\bno problem\b/.test(t)) return false;
-  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac))/i.test(t);
+  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac)|\bvery (hot|cold)\b|burning up|freezing)/i.test(t);
 }
 function addEmpathy(speech, reply) {
   if (detectedProblem(speech) && !/\b(sorry|apologiz)/i.test(reply)) {
@@ -585,7 +616,6 @@ export default async function handler(req, res) {
 
     // --- CALLBACK NUMBER CONFIRMATION GATE ---
     if (mergedSlots.callback_confirm_pending === true) {
-      // Require a captured number to use this gate
       const n = mergedSlots.callback_number || '';
       if (!n) {
         mergedSlots.callback_confirm_pending = false;
