@@ -4,8 +4,8 @@ import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
 export const config = { api: { bodyParser: false } };
 
-// ✅ Use a single selected voice everywhere
-const SELECTED_VOICE = process.env.TTS_VOICE || null; // e.g., "Polly.Joanna"
+// Use a single selected voice everywhere (passed through to /api/tts)
+const SELECTED_VOICE = process.env.TTS_VOICE || null;
 
 function sendXml(res, twiml) {
   res.setHeader('Content-Type', 'text/xml');
@@ -46,10 +46,9 @@ function withTimeout(ms) {
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
-// ---------- Anti-restart guard ----------
+// ---------- Intro replay guard ----------
 async function introAlreadyPlayed(supabase, callSid) {
-  // Fail-safe: if no callSid, assume intro already played (never replay)
-  if (!callSid) return true;
+  if (!callSid) return true; // fail-safe
   try {
     const { data } = await supabase
       .from('call_transcripts')
@@ -66,8 +65,8 @@ async function introAlreadyPlayed(supabase, callSid) {
         if (/(^|\s)welcome to h\.?\s*v\.?\s*a\.?\s*c/i.test(row.text || '')) return true;
       }
     }
-    return seenAssistant; // if any assistant line exists, don’t re-intro
-  } catch (_) { return true; } // fail-safe: never replay intro
+    return seenAssistant;
+  } catch (_) { return true; }
 }
 
 async function getLastAssistantQuestion(supabase, callSid) {
@@ -81,7 +80,7 @@ async function getLastAssistantQuestion(supabase, callSid) {
 
     for (const row of (data || [])) {
       if (row.role !== 'assistant') continue;
-      if (row?.meta?.type === 'intro') continue; // skip intros
+      if (row?.meta?.type === 'intro') continue;
       if (row?.meta?.last_question) return String(row.meta.last_question);
       const t = (row.text || '').trim();
       if (t.endsWith('?')) return t;
@@ -102,7 +101,7 @@ function userSaysWeAreScheduling(text = '') {
   return /\b(scheduling|schedule|book|at the end|ready to book|set (it|this) up)\b/i.test(text || '');
 }
 
-// ---------- Goodbye helpers ----------
+// ---------- Call-ahead helpers ----------
 function makeGoodbyeFromSlots(slots = {}) {
   const firstName = (slots.full_name || '').split(' ')[0] || '';
   const date = slots.preferred_date ? String(slots.preferred_date) : '';
@@ -123,11 +122,17 @@ function normalizeCallAheadInText(text = '', slots = {}) {
   return text;
 }
 
-// Empathy on webhook fallback (if /api/chat fails)
+// ---------- Sympathy helpers ----------
+function detectedProblem(text = '') {
+  const t = (text || '').toLowerCase();
+  if (/\bno problem\b/.test(t)) return false; // avoid “no problem”
+  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac))/i.test(t);
+}
+
 function maybeAddEmpathyOnFallback(userText, reply) {
-  const t = (userText || '').toLowerCase();
-  const problem = /\b(no (cool|cold|heat)|not (cooling|cold|working)|blowing (hot|warm)|very hot|unit.*(down|out)|ac (is )?(out|down|broke|broken|busted)|system (is )?(out|down|broken|broke))\b/.test(t);
-  if (problem && !/sorry|apologiz/i.test(reply)) return `I’m sorry to hear that. ${reply}`;
+  if (detectedProblem(userText) && !/sorry|apologiz/i.test(reply)) {
+    return `I’m sorry to hear that. ${reply}`;
+  }
   return reply;
 }
 
@@ -165,22 +170,13 @@ export default async function handler(req, res) {
   // First/noisy turn handling
   if ((!speech || isUnclear(speech)) && !userSaysWeAreScheduling(speech)) {
     if (!introPlayed) {
-      // 1) Log readable text (transcript)
       const introDisplay =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const example =
         'Please say the full address in one sentence, for example: 123 Main Street, Washington, DC 10001.';
 
-      await logTurn({
-        supabase,
-        caller: from,
-        callSid,
-        text: introDisplay,
-        role: 'assistant',
-        meta: { type: 'intro' }
-      });
+      await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
-      // 2) Speak the intro (listen first), then example if no input
       const welcome = 'Welcome to H. V. A. C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
       const exampleUrl = ttsUrlAbsolute(baseUrl, example, SELECTED_VOICE);
@@ -190,7 +186,6 @@ export default async function handler(req, res) {
         SELECTED_VOICE
       );
 
-      // ✅ Gather immediately after welcome; only then play example if needed
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${welcomeUrl}</Play>
@@ -234,13 +229,11 @@ export default async function handler(req, res) {
         .order('turn_index', { ascending: false })
         .limit(12);
 
-      // Prefer the most recent assistant turn WITH slots (skip intro-only turns)
       const lastAssistantWithSlots = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.slots
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
-      // Prefer a last_question that isn't an intro
       const lastAssistantWithQMeta = (lastTurns || []).find(
         t => t.role === 'assistant' && t?.meta?.last_question && t?.meta?.type !== 'intro'
       );
@@ -291,6 +284,7 @@ export default async function handler(req, res) {
       reply = maybeAddEmpathyOnFallback(speech, "Thanks. I heard you. Give me just a moment.");
     }
 
+    // respect call-ahead preference in any generated line
     reply = normalizeCallAheadInText(reply, slots);
 
     const meta = { slots, done, goodbye };

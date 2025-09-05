@@ -2,18 +2,18 @@
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
-// ✅ Company pricing from env (defaults match your boss’s policy)
+// Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
 const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
 const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
 
-// Southern-charm + guardrails (no gendered address; keep intro copy elsewhere)
+// Persona/prompt (neutral, polite tone; no gendered address)
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
 Voice & Style
-- Friendly Southern charm; warm, professional, and concise (≤ 14 words).
+- Friendly, professional, and concise (≤ 14 words).
 - Use plain language (≈ 8th grade). Natural “please” and “thank you.”
 - When the caller says “thank you,” respond with “It’s my pleasure.”
 - Avoid gendered address (no sir/ma’am, no Mr./Ms.). Keep it neutral.
@@ -200,7 +200,6 @@ function normState(s) {
   return abbr || null;
 }
 
-// Normalize punctuation for address parsing (handles "2478. Kaley walk. …")
 function cleanAddressText(line = '') {
   return line
     .replace(/(\d)\.(?=\s|$)/g, '$1')
@@ -214,11 +213,10 @@ const STREET_SUFFIX =
 function parseFullAddress(line) {
   const txt = cleanAddressText(line);
 
-  // City non-greedy, word boundary before ZIP, then fallback path
   const re = new RegExp(
     `\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
-    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +                    // city (non-greedy)
-    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +   // state (full or 2-letter)
+    `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
@@ -229,24 +227,24 @@ function parseFullAddress(line) {
     const state = normState(stateToken);
     if (!state) return null;
     return {
-      line1: m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim(),
+      // remove stray commas within street name for cleaner TTS/readback
+      line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
       city: m[2].trim(),
       state,
       zip: m[5]
     };
   }
 
-  // Fallback: combine line1 + city/state/zip parsed separately
   const line1 = parseAddressLine1(txt);
   const csz = parseCityStateZip(txt);
-  if (line1 && csz) return { line1, ...csz };
+  if (line1 && csz) return { line1: line1.replace(/,\s*/g, ' ').trim(), ...csz };
   return null;
 }
 
 function parseAddressLine1(text) {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(new RegExp(`\\b(\\d{2,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b`, 'i'));
-  return m ? m[1].replace(/\s+,/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
+  return m ? m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim() : null;
 }
 function parseCityStateZip(text = '') {
   const txt = cleanAddressText(text);
@@ -298,7 +296,28 @@ function parseUnitCount(text) {
   return null;
 }
 
-// ----------------- Steer/clean replies ------------------
+// ----------------- Detectors & cleaners ------------------
+function detectedProblem(text = '') {
+  const t = (text || '').toLowerCase();
+  if (/\bno problem\b/.test(t)) return false;
+  return /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac))/i.test(t);
+}
+function addEmpathy(speech, reply) {
+  if (detectedProblem(speech) && !/\b(sorry|apologiz)/i.test(reply)) {
+    return `I’m sorry to hear that. ${reply}`;
+  }
+  return reply;
+}
+
+// quick yes/no helpers (tolerate common ASR “know” → “no”)
+function isAffirmation(text='') {
+  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
+}
+function isNegation(text='') {
+  return /\b(no|nope|nah|know|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
+}
+
+// Branding & reply guards
 function wantsToContinue(text='') {
   return /\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(text || '');
 }
@@ -323,7 +342,7 @@ function suppressMembershipUntilBooked(reply, slots) {
 function nextMissingPrompt(s) {
   const addr = s.service_address || {};
   if (!s.full_name) return 'Can I have your full name, please?';
-  if (!s.callback_number) return 'Thank you. What’s the best callback number?';
+  if (!s.callback_number) return 'Thank you. What’s the full 10-digit callback number?';
   if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
     return 'Please say the full service address in one sentence, including street, city, state, and zip.';
   }
@@ -336,8 +355,6 @@ function nextMissingPrompt(s) {
   if (!s.preferred_window) return 'What time window works for you—morning, afternoon, or flexible all day?';
   return null;
 }
-
-// ---- Repeat guard for time window question
 function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   if (!lastQ || !newQ) return { newReply: null, updated: false };
   if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
@@ -351,8 +368,6 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   }
   return { newReply: null, updated: false };
 }
-
-// Suppress pricing repeats after it’s been disclosed
 function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   if (mergedSlots.pricing_disclosed === true &&
       /diagnostic/i.test(reply) &&
@@ -362,26 +377,7 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// Empathy: broader trigger + require explicit "sorry/apologize"
-function addEmpathy(speech, reply) {
-  const t = (speech || '').toLowerCase();
-  const problem =
-    /\b(no (cool|cold|heat)|not (cooling|cold|working)|blowing (hot|warm)|very hot|unit.*(down|out)|ac (is )?(out|down|broke|broken|busted)|system (is )?(out|down|broken|broke))\b/.test(t);
-  if (problem && !/\b(sorry|apologiz)/i.test(reply)) {
-    return `I’m sorry to hear that. ${reply}`;
-  }
-  return reply;
-}
-
-// quick yes/no helpers
-function isAffirmation(text='') {
-  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
-}
-function isNegation(text='') {
-  return /\b(no|nope|nah|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
-}
-
-// Summary helper
+// Summary
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
@@ -400,12 +396,11 @@ function summaryFromSlots(s) {
 - AC units: ${units}${locs}
 - Brand: ${brand}
 - Thermostat setpoint: ${sp}, current: ${cur}
-- Appointment: ${date || 'scheduled'}${window ? ` (${window})` : ''}
+- Appointment: ${date || 'scheduled'}${window ? ' (' + window + ')' : ''}
 - ${callAhead}
 - Diagnostic fee: $${DIAG_FEE}.`;
 }
 
-// REQUIRE both date and window now
 function serverSideDoneCheck(slots) {
   const s = slots || {};
   const addr = s.service_address || {};
@@ -537,7 +532,6 @@ export default async function handler(req, res) {
         });
       }
 
-      // Unclear → ask for explicit yes/no or change
       return res.status(200).json({
         reply: "If everything is correct, please say “yes.” Otherwise, tell me what to change.",
         slots: mergedSlots,
@@ -591,7 +585,21 @@ export default async function handler(req, res) {
 
     // --- CALLBACK NUMBER CONFIRMATION GATE ---
     if (mergedSlots.callback_confirm_pending === true) {
+      // Require a captured number to use this gate
       const n = mergedSlots.callback_number || '';
+      if (!n) {
+        mergedSlots.callback_confirm_pending = false;
+        return res.status(200).json({
+          reply: 'What’s the full 10-digit callback number?',
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+
       if (isAffirmation(speech) && !isNegation(speech)) {
         mergedSlots.callback_confirm_pending = false;
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
@@ -659,7 +667,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- “let’s continue / move on” → next missing item (but not during gates)
+    // ---- Continue / move on → next missing
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
@@ -749,6 +757,11 @@ export default async function handler(req, res) {
     // merge with old slots
     mergedSlots = mergeSlots(mergedSlots, parsed.slots);
 
+    // sanitize: never allow confirm gate without a number
+    if (mergedSlots.callback_confirm_pending && !mergedSlots.callback_number) {
+      mergedSlots.callback_confirm_pending = false;
+    }
+
     // heuristics
     if (!mergedSlots.preferred_window) {
       const win = inferPreferredWindowFrom(speech);
@@ -764,43 +777,42 @@ export default async function handler(req, res) {
       }
     }
     {
-      // Only infer call-ahead when the last asked question was about call-ahead
       const inferred = inferYesNoCallAhead(speech);
       if (inferred !== null && /call[- ]ahead/i.test(lastQ || '')) {
         mergedSlots.call_ahead = inferred;
       }
     }
 
-    // If the model tries to schedule before price disclosure, force the price line
+    // pricing must precede scheduling
     if (mergedSlots.pricing_disclosed !== true &&
         /(?:schedule|book|calendar|what day works|time window|morning|afternoon|flexible)/i.test(parsed.reply || '')) {
       parsed.reply = `${priceLine} Shall we proceed?`;
     }
 
-    // Time-window repeat guard
+    // window repeat guard
     const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
 
-    // Prevent repeated thermostat question if both values are present
+    // thermostat duplicate guard
     if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
         (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
       parsed.reply = `Great—thanks. ${priceLine} What day works for your visit?`;
     }
 
-    // If the model says "schedule" but we’re missing required pieces, push next missing prompt
+    // “schedule” but missing required → push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
       const prompt = nextMissingPrompt(mergedSlots);
       if (prompt) parsed.reply = prompt;
     }
 
-    // “It’s my pleasure” micro-hook (once per call)
+    // “It’s my pleasure” micro-hook (once)
     const saidThanks = /\b(thanks|thank you|appreciate it)\b/i.test(speech || '');
     if (saidThanks && !mergedSlots._pleasure_ack && !/\bit'?s my pleasure\b/i.test(parsed.reply)) {
       parsed.reply = `${parsed.reply} It’s my pleasure.`;
       mergedSlots._pleasure_ack = true;
     }
 
-    // Final cleanups
+    // Final cleanups (includes empathy)
     parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
     parsed.reply = suppressMembershipUntilBooked(parsed.reply, mergedSlots);
     parsed.reply = addEmpathy(speech, parsed.reply);
@@ -813,7 +825,6 @@ export default async function handler(req, res) {
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      // Only read the summary the first time we reach done
       if ((mergedSlots.summary_reads || 0) < 1) {
         replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, please tell me what to change.";
         mergedSlots.summary_reads = (mergedSlots.summary_reads || 0) + 1;
