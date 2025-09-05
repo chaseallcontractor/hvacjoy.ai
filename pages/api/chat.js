@@ -2,22 +2,28 @@
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
+// ✅ Company pricing from env (defaults match your boss’s policy)
+const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
+const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
+const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
+
+// Southern-charm + guardrails (no gendered address; keep intro copy elsewhere)
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
 Voice & Style
-- Warm, professional, concise. Short sentences (<= 14 words).
-- When a caller reports a problem or discomfort, briefly acknowledge and comfort.
-- Confirm important items briefly after capturing them.
-- Avoid meta talk (“we already did this”). Be forward-looking and helpful.
+- Friendly Southern charm; warm, professional, and concise (≤ 14 words).
+- Use plain language (≈ 8th grade). Natural “please” and “thank you.”
+- When the caller says “thank you,” respond with “It’s my pleasure.”
+- Avoid gendered address (no sir/ma’am, no Mr./Ms.). Keep it neutral.
+- Briefly acknowledge discomfort or problems, then help.
 
 Safety & Guardrails
-- Only give these prices:
-  - Diagnostic visit: $50 per non-working unit.
-  - Maintenance visit: $50 for non-members.
+- ${priceLine}
 - Never promise exact arrival times. Offer a window and a call-ahead.
-- If smoke, sparks, gas smell, or health risk: advise 911 and escalate.
+- If smoke, sparks, gas smell, or health risk: advise calling 911 and escalate.
+- Do not discuss competitor pricing or quote repair costs beyond policy.
 - Ask permission before any hold.
 
 Call Flow
@@ -33,10 +39,17 @@ Call Flow
    - Thermostat setpoint and current reading
 4) Pricing disclosure before scheduling.
 5) Scheduling:
-   - Offer earliest availability, **ask for a date**, then arrival window + call-ahead.
+   - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
+   - If caller is flexible all day, note "flexible_all_day."
 6) Membership check (after booking).
-7) Confirm & summarize.
+7) Confirm & summarize once.
 8) Close politely.
+
+Edge Scripts (use when relevant)
+- Ants/pests: “Thanks for sharing that. Please avoid spraying chemicals before the technician arrives.”
+- Icing: “Thank you. If you see ice, please turn the system off so it can melt.”
+- Reschedule: “Of course—happy to help. What new time works best?”
+- Irate caller: “I understand this is frustrating. I can secure your details, explain today’s fees, and book the earliest available appointment.”
 
 Output format (single JSON):
 {
@@ -137,11 +150,13 @@ function inferPreferredWindowFrom(text) {
   if (/\bmorning\b/.test(t)) return 'morning';
   if (/\bafternoon\b/.test(t)) return 'afternoon';
   if (/\bevening\b/.test(t)) return 'afternoon';
+  if (/\bflexible\b.*\ball day\b|\ball day\b.*\bflexible\b/i.test(t)) return 'flexible_all_day';
   return null;
 }
 function statementMentionsPricing(text) {
   const t = (text || '').toLowerCase();
-  return /\bdiagnostic\b/.test(t) && /(?:\$|usd\s*)?50\b/.test(t);
+  const fee = String(DIAG_FEE);
+  return /\bdiagnostic\b/.test(t) && new RegExp(`(?:\\$|usd\\s*)?${fee}\\b`).test(t);
 }
 function inferYesNoCallAhead(text) {
   const t = (text || '').toLowerCase();
@@ -307,18 +322,18 @@ function suppressMembershipUntilBooked(reply, slots) {
 }
 function nextMissingPrompt(s) {
   const addr = s.service_address || {};
-  if (!s.full_name) return 'Can I have your full name?';
-  if (!s.callback_number) return 'Great. What’s the best callback number?';
+  if (!s.full_name) return 'Can I have your full name, please?';
+  if (!s.callback_number) return 'Thank you. What’s the best callback number?';
   if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
     return 'Please say the full service address in one sentence, including street, city, state, and zip.';
   }
   if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
   if (!((s.thermostat||{}).setpoint != null && (s.thermostat||{}).current != null)) {
-    return 'What is the thermostat setpoint and the current reading?';
+    return 'What is the thermostat setpoint, and what does it currently read?';
   }
-  if (s.pricing_disclosed !== true) return 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
+  if (s.pricing_disclosed !== true) return `${priceLine} Shall we proceed?`;
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
-  if (!s.preferred_window) return 'What time window works for you—morning or afternoon?';
+  if (!s.preferred_window) return 'What time window works for you—morning, afternoon, or flexible all day?';
   return null;
 }
 
@@ -330,7 +345,7 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   if (win && !mergedSlots.preferred_window) {
     mergedSlots.preferred_window = win;
     return {
-      newReply: `Got it — we'll reserve the ${win} window. Which day works best for you?`,
+      newReply: `Got it—we'll reserve the ${win} window. Which day works best for you?`,
       updated: true
     };
   }
@@ -339,7 +354,9 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
 
 // Suppress pricing repeats after it’s been disclosed
 function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
-  if (mergedSlots.pricing_disclosed === true && /diagnostic/i.test(reply) && /\$?50\b/.test(reply)) {
+  if (mergedSlots.pricing_disclosed === true &&
+      /diagnostic/i.test(reply) &&
+      new RegExp(`\\$?${DIAG_FEE}\\b`).test(reply)) {
     return 'Great—thanks for confirming. Let’s get your visit on the calendar.';
   }
   return reply;
@@ -385,7 +402,7 @@ function summaryFromSlots(s) {
 - Thermostat setpoint: ${sp}, current: ${cur}
 - Appointment: ${date || 'scheduled'}${window ? ` (${window})` : ''}
 - ${callAhead}
-- Diagnostic fee: $50.`;
+- Diagnostic fee: $${DIAG_FEE}.`;
 }
 
 // REQUIRE both date and window now
@@ -477,6 +494,19 @@ export default async function handler(req, res) {
     let mergedSlots = { ...(lastSlots || {}) };
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
+
+    // --- EMERGENCY FAST-PATH ---
+    if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell)\b/i.test(speech || '')) {
+      return res.status(200).json({
+        reply: "If you suspect a safety issue, please hang up and call 911 now. I’ll also alert our dispatcher immediately. Are you safe to continue?",
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: true,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
 
     // --- FINAL CONFIRMATION GATE ---
     if (mergedSlots.confirmation_pending === true) {
@@ -743,8 +773,8 @@ export default async function handler(req, res) {
 
     // If the model tries to schedule before price disclosure, force the price line
     if (mergedSlots.pricing_disclosed !== true &&
-        /(?:schedule|book|calendar|what day works|time window|morning|afternoon)/i.test(parsed.reply || '')) {
-      parsed.reply = 'Our diagnostic visit is $50 per non-working unit. Shall we proceed?';
+        /(?:schedule|book|calendar|what day works|time window|morning|afternoon|flexible)/i.test(parsed.reply || '')) {
+      parsed.reply = `${priceLine} Shall we proceed?`;
     }
 
     // Time-window repeat guard
@@ -754,13 +784,20 @@ export default async function handler(req, res) {
     // Prevent repeated thermostat question if both values are present
     if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
         (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
-      parsed.reply = 'Great—thanks. Our diagnostic visit is $50 per non-working unit. What day works for your visit?';
+      parsed.reply = `Great—thanks. ${priceLine} What day works for your visit?`;
     }
 
     // If the model says "schedule" but we’re missing required pieces, push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
       const prompt = nextMissingPrompt(mergedSlots);
       if (prompt) parsed.reply = prompt;
+    }
+
+    // “It’s my pleasure” micro-hook (once per call)
+    const saidThanks = /\b(thanks|thank you|appreciate it)\b/i.test(speech || '');
+    if (saidThanks && !mergedSlots._pleasure_ack && !/\bit'?s my pleasure\b/i.test(parsed.reply)) {
+      parsed.reply = `${parsed.reply} It’s my pleasure.`;
+      mergedSlots._pleasure_ack = true;
     }
 
     // Final cleanups
@@ -778,10 +815,10 @@ export default async function handler(req, res) {
     if (serverDone) {
       // Only read the summary the first time we reach done
       if ((mergedSlots.summary_reads || 0) < 1) {
-        replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, say what you’d like to change.";
+        replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, please tell me what to change.";
         mergedSlots.summary_reads = (mergedSlots.summary_reads || 0) + 1;
       } else {
-        replyOut = 'Is everything correct? If not, say what you’d like to change.';
+        replyOut = 'Is everything correct? If not, please tell me what to change.';
       }
       needs_confirmation = true;
       mergedSlots.confirmation_pending = true;

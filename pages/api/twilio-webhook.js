@@ -4,6 +4,9 @@ import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
 export const config = { api: { bodyParser: false } };
 
+// ✅ Use a single selected voice everywhere
+const SELECTED_VOICE = process.env.TTS_VOICE || null; // e.g., "Polly.Joanna"
+
 function sendXml(res, twiml) {
   res.setHeader('Content-Type', 'text/xml');
   res.status(200).send(twiml);
@@ -16,10 +19,10 @@ function baseUrlFromReq(req) {
   return `${proto}://${host}`;
 }
 
-// used by <Play> everywhere, including the intro now
+// Used by <Play> everywhere (intro included)
 function ttsUrlAbsolute(baseUrl, text, voice) {
   const params = new URLSearchParams({ text });
-  if (voice) params.set('voice', voice); // optional; your /api/tts can read a default
+  if (voice) params.set('voice', voice); // your /api/tts can also default
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
@@ -45,7 +48,7 @@ function withTimeout(ms) {
 
 // ---------- Anti-restart guard ----------
 async function introAlreadyPlayed(supabase, callSid) {
-  // Fail-safe: if we don't have a callSid, assume intro already played (never replay)
+  // Fail-safe: if no callSid, assume intro already played (never replay)
   if (!callSid) return true;
   try {
     const { data } = await supabase
@@ -120,6 +123,14 @@ function normalizeCallAheadInText(text = '', slots = {}) {
   return text;
 }
 
+// Empathy on webhook fallback (if /api/chat fails)
+function maybeAddEmpathyOnFallback(userText, reply) {
+  const t = (userText || '').toLowerCase();
+  const problem = /\b(no (cool|cold|heat)|not (cooling|cold|working)|blowing (hot|warm)|very hot|unit.*(down|out)|ac (is )?(out|down|broke|broken|busted)|system (is )?(out|down|broken|broke))\b/.test(t);
+  if (problem && !/sorry|apologiz/i.test(reply)) return `I’m sorry to hear that. ${reply}`;
+  return reply;
+}
+
 // Common <Gather> attributes
 function gatherAttrs(actionUrl) {
   return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, A through Z" profanityFilter="false"`;
@@ -160,21 +171,35 @@ export default async function handler(req, res) {
       const example =
         'Please say the full address in one sentence, for example: 123 Main Street, Washington, DC 10001.';
 
-      await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
+      await logTurn({
+        supabase,
+        caller: from,
+        callSid,
+        text: introDisplay,
+        role: 'assistant',
+        meta: { type: 'intro' }
+      });
 
-      // 2) Speak the intro + example with your selected TTS voice
+      // 2) Speak the intro (listen first), then example if no input
       const welcome = 'Welcome to H. V. A. C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
-      const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome);               // uses your /api/tts voice
-      const exampleUrl = ttsUrlAbsolute(baseUrl, example);
+      const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
+      const exampleUrl = ttsUrlAbsolute(baseUrl, example, SELECTED_VOICE);
+      const didntCatchUrl = ttsUrlAbsolute(
+        baseUrl,
+        'Sorry, I didn’t catch that. Please say the full address in one sentence, including street, city, state, and zip.',
+        SELECTED_VOICE
+      );
 
+      // ✅ Gather immediately after welcome; only then play example if needed
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${welcomeUrl}</Play>
   <Pause length="1"/>
+  <Gather ${gatherAttrs(actionUrl)}/>
   <Play>${exampleUrl}</Play>
   <Pause length="1"/>
   <Gather ${gatherAttrs(actionUrl)}/>
-  <Play>${ttsUrlAbsolute(baseUrl, "Sorry, I didn’t catch that. Please say the full address in one sentence, including street, city, state, and zip.")}</Play>
+  <Play>${didntCatchUrl}</Play>
   <Pause length="1"/>
   <Gather ${gatherAttrs(actionUrl)}/>
   <Redirect method="POST">${actionUrl}</Redirect>
@@ -183,7 +208,7 @@ export default async function handler(req, res) {
     } else {
       const lastQ = await getLastAssistantQuestion(supabase, callSid);
       const prompt = lastQ || 'Sorry, I didn’t catch that. Could you please repeat that?';
-      const url = ttsUrlAbsolute(baseUrl, prompt);
+      const url = ttsUrlAbsolute(baseUrl, prompt, SELECTED_VOICE);
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${url}</Play>
@@ -259,11 +284,11 @@ export default async function handler(req, res) {
       } else {
         const text = await resp?.text();
         console.error('Chat API error:', text);
-        reply = "Thanks. I heard you. Give me just a moment.";
+        reply = maybeAddEmpathyOnFallback(speech, "Thanks. I heard you. Give me just a moment.");
       }
     } catch (e) {
       console.error('Chat API error:', e);
-      reply = "Thanks. I heard you. Give me just a moment.";
+      reply = maybeAddEmpathyOnFallback(speech, "Thanks. I heard you. Give me just a moment.");
     }
 
     reply = normalizeCallAheadInText(reply, slots);
@@ -275,9 +300,9 @@ export default async function handler(req, res) {
     await logTurn({ supabase, caller: from, callSid, text: reply, role: 'assistant', meta });
 
     if (done) {
-      const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+      const replyUrl = ttsUrlAbsolute(baseUrl, reply, SELECTED_VOICE);
       const byeText = (goodbye && goodbye.trim()) ? goodbye : makeGoodbyeFromSlots(slots);
-      const byeUrl = ttsUrlAbsolute(baseUrl, byeText);
+      const byeUrl = ttsUrlAbsolute(baseUrl, byeText, SELECTED_VOICE);
 
       if (needs_confirmation) {
         const twiml = `<?xml version="1.0" encoding="UTF-8"?>
@@ -300,7 +325,7 @@ export default async function handler(req, res) {
       }
     }
 
-    const replyUrl = ttsUrlAbsolute(baseUrl, reply);
+    const replyUrl = ttsUrlAbsolute(baseUrl, reply, SELECTED_VOICE);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${replyUrl}</Play>
@@ -313,7 +338,8 @@ export default async function handler(req, res) {
     console.error('Webhook error:', err);
     const fallbackUrl = ttsUrlAbsolute(
       baseUrl,
-      'Sorry, I ran into a problem. I will connect you to a live agent.'
+      'Sorry, I ran into a problem. I will connect you to a live agent.',
+      SELECTED_VOICE
     );
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
