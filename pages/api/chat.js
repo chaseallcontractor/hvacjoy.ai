@@ -42,7 +42,7 @@ Call Flow
    - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
    - If caller is flexible all day, note "flexible_all_day."
 6) Membership check (after booking).
-7) Confirm & summarize once.
+7) Confirm politely (no long read-back).
 8) Close politely.
 
 Edge Scripts (use when relevant)
@@ -99,7 +99,7 @@ Behavior
 - Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
 - Require a date for booking (not only a window). Ask for date first, then window.
 - If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
-- When done is reached, read a short summary **once**, then ask “Is everything correct?”
+- When done is reached, ask a short confirmation only (no long summary).
 `.trim();
 
 function withTimeout(ms) {
@@ -370,6 +370,7 @@ function suppressMembershipUntilBooked(reply, slots) {
   }
   return reply;
 }
+
 function nextMissingPrompt(s) {
   const addr = s.service_address || {};
   if (!s.full_name) return 'Can I have your full name, please?';
@@ -408,7 +409,13 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// Summary
+// NEW: detect yes/no style questions for fast “Yes” handling
+function isYesNoQuestion(q = '') {
+  const t = (q || '').toLowerCase();
+  return /\b(is (?:that|this) (?:right|correct)|shall we proceed|is everything correct|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
+}
+
+// Summary helper retained but no longer spoken
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
@@ -711,10 +718,29 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Normal LLM step ---------------------------------------------------
+    // NEW: “Yes” to a yes/no question should advance the flow
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
+    if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending) {
+      if (isAffirmation(speech) && isYesNoQuestion(lastQ)) {
+        // apply any semantic effects of the yes
+        if (/call[- ]ahead/i.test(lastQ)) mergedSlots.call_ahead = true;
+        if (/shall we proceed|price|diagnostic|\$\s*\d+/i.test(lastQ)) mergedSlots.pricing_disclosed = true;
 
+        const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+        return res.status(200).json({
+          reply: enforceHVACBranding(prompt),
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+    }
+
+    // ---- Normal LLM step ---------------------------------------------------
     const steering =
       'Continue the call. Do not repeat the greeting.' +
       '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
@@ -855,12 +881,8 @@ export default async function handler(req, res) {
     let needs_confirmation = false;
     let replyOut = parsed.reply;
     if (serverDone) {
-      if ((mergedSlots.summary_reads || 0) < 1) {
-        replyOut = "Here’s a quick summary:\n" + summaryFromSlots(mergedSlots) + "\nIs everything correct? If not, please tell me what to change.";
-        mergedSlots.summary_reads = (mergedSlots.summary_reads || 0) + 1;
-      } else {
-        replyOut = 'Is everything correct? If not, please tell me what to change.';
-      }
+      // Boss request: no spoken summary; just a short confirmation
+      replyOut = 'Is everything correct? If not, please tell me what to change.';
       needs_confirmation = true;
       mergedSlots.confirmation_pending = true;
     }
