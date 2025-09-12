@@ -90,7 +90,9 @@ slots schema:
   "confirmation_pending": null | true | false,
   "summary_reads": null | <number>,
   "address_confirm_pending": null | true | false,
-  "callback_confirm_pending": null | true | false
+  "callback_confirm_pending": null | true | false,
+
+  "_phone_partial": null | "<digits so far>"
 }
 
 Behavior
@@ -317,14 +319,36 @@ function parseCityStateZip(text = '') {
   return { city, state, zip };
 }
 
+// ---------- Phone parsing & accumulation ----------
+// Smarter parser: fixes "404-4444 2544", strips country code, formats 3-3-4.
 function parsePhone(text) {
-  const digits = (text || '').replace(/\D+/g, '');
-  if (digits.length >= 10) {
-    const last10 = digits.slice(-10);
-    return { full: `${last10.slice(0,3)}-${last10.slice(3,6)}-${last10.slice(6)}`, complete: true };
+  const raw = (text || '').replace(/\D+/g, '');
+  const fmt = (d10) => `${d10.slice(0,3)}-${d10.slice(3,6)}-${d10.slice(6)}`;
+
+  if (!raw) return null;
+
+  let digits = raw;
+  // Drop leading US country code if present
+  if (digits.length === 11 && digits[0] === '1') digits = digits.slice(1);
+
+  if (digits.length === 10) {
+    return { full: fmt(digits), complete: true };
   }
-  if (digits.length >= 6) return { partial: digits, complete: false };
-  return null;
+
+  // ASR glitch fixer: 3 + 7/8 digits (e.g., "404-4444 2544" -> 404-444-2544)
+  if (digits.length === 11 || digits.length === 12) {
+    const area = digits.slice(0, 3);
+    const local7 = digits.slice(-7);
+    return { full: fmt(area + local7), complete: true };
+  }
+
+  if (digits.length > 10) {
+    const last10 = digits.slice(-10);
+    return { full: fmt(last10), complete: true };
+  }
+
+  // 1–9 digits → partial
+  return { partial: digits, complete: false };
 }
 
 // ----------------- Detectors & cleaners ------------------
@@ -415,7 +439,7 @@ function isYesNoQuestion(q = '') {
   return /\b(is (?:that|this) (?:right|correct)|shall we proceed|is everything correct|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
 }
 
-// Summary helper retained but no longer spoken
+// Summary helper retained (not spoken)
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
@@ -482,30 +506,45 @@ function handleAddressProgress_STRICT(speech, slots) {
   };
 }
 
-// ---- Phone progress: accept full 10; set confirm gate; reject partial
+// ---- Phone progress: accumulate digits across turns & confirm when complete
 function handlePhoneProgress(speech, slots) {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
 
-  const p = parsePhone(speech);
-  if (!p) return { slots: s, reply: null, handled: false };
+  const heardDigits = (speech || '').replace(/\D+/g, '');
+  const existing = (s._phone_partial || '').replace(/\D+/g, '');
 
-  if (p.complete) {
-    s.callback_number = p.full;
+  // If nothing number-like has been said yet, bail out.
+  if (!heardDigits && !existing) {
+    return { slots: s, reply: null, handled: false };
+  }
+
+  const combined = (existing + heardDigits).slice(0, 16); // safety cap
+  const parsed = parsePhone(combined);
+
+  if (parsed && parsed.complete) {
+    s.callback_number = parsed.full;
     s.callback_confirm_pending = true;
+    s._phone_partial = '';
     return {
       slots: s,
-      reply: `Thanks. I have your callback number as ${p.full}. Is that correct?`,
+      reply: `Thanks. I have your callback number as ${parsed.full}. Is that correct?`,
       handled: true
     };
   }
 
-  // partial
-  return {
-    slots: s,
-    reply: 'I heard the beginning. What’s the full 10-digit callback number?',
-    handled: true
-  };
+  // Still incomplete—stash what we have and ask for the rest
+  if (combined.length > 0) {
+    s._phone_partial = combined;
+    const remaining = Math.max(10 - combined.length, 1);
+    return {
+      slots: s,
+      reply: `I heard the beginning. Please say the remaining ${remaining} digit${remaining > 1 ? 's' : ''} of the 10-digit number.`,
+      handled: true
+    };
+  }
+
+  return { slots: s, reply: null, handled: false };
 }
 
 export default async function handler(req, res) {
@@ -689,7 +728,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Phone progress (accept full 10; reject partial)
+    // ---- Phone progress (accumulate & format)
     const phoneProgress = handlePhoneProgress(speech, mergedSlots);
     if (phoneProgress.handled) {
       mergedSlots = phoneProgress.slots;
