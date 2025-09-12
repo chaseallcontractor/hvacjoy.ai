@@ -181,7 +181,7 @@ export default async function handler(req, res) {
 
       await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
-      const welcome = 'Welcome to H. V. A. C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+      const welcome = 'Welcome to H. V. A. C Joy. I am your digital assistant Rachel. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
       const exampleUrl = ttsUrlAbsolute(baseUrl, example, SELECTED_VOICE);
       const didntCatchUrl = ttsUrlAbsolute(
