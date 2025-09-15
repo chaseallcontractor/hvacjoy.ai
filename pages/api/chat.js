@@ -101,7 +101,7 @@ Behavior
 - Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
 - Require a date for booking (not only a window). Ask for date first, then window.
 - If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
-- When done is reached, ask a short confirmation only (no long summary).
+- When done is reached, do NOT read any summary and do NOT ask “Is everything correct?” — simply close politely.
 `.trim();
 
 function withTimeout(ms) {
@@ -320,6 +320,22 @@ function parseCityStateZip(text = '') {
 }
 
 // ---------- Phone parsing & accumulation ----------
+function normalizeDigitWords(s = '') {
+  // Convert spoken numbers (“seven”, “oh”) into digits so we can parse phones reliably.
+  return (s || '')
+    .replace(/\b(oh|o)\b/gi, '0')
+    .replace(/\bzero\b/gi, '0')
+    .replace(/\bone\b/gi, '1')
+    .replace(/\btwo\b/gi, '2')
+    .replace(/\bthree\b/gi, '3')
+    .replace(/\bfour\b/gi, '4')
+    .replace(/\bfive\b/gi, '5')
+    .replace(/\bsix\b/gi, '6')
+    .replace(/\bseven\b/gi, '7')
+    .replace(/\beight\b/gi, '8')
+    .replace(/\bnine\b/gi, '9');
+}
+
 // Smarter parser: fixes "404-4444 2544", strips country code, formats 3-3-4.
 function parsePhone(text) {
   const raw = (text || '').replace(/\D+/g, '');
@@ -433,13 +449,13 @@ function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
   return reply;
 }
 
-// NEW: detect yes/no style questions for fast “Yes” handling
+// Detect yes/no-style questions for fast handling
 function isYesNoQuestion(q = '') {
   const t = (q || '').toLowerCase();
-  return /\b(is (?:that|this) (?:right|correct)|shall we proceed|is everything correct|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
+  return /\b(is (?:that|this) (?:right|correct)|shall we proceed|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
 }
 
-// Summary helper retained (not spoken)
+// (kept for internal use, not spoken)
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
@@ -511,7 +527,8 @@ function handlePhoneProgress(speech, slots) {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
 
-  const heardDigits = (speech || '').replace(/\D+/g, '');
+  // Accept spoken numbers like "seven one two..."
+  const heardDigits = normalizeDigitWords(speech || '').replace(/\D+/g, '');
   const existing = (s._phone_partial || '').replace(/\D+/g, '');
 
   // If nothing number-like has been said yet, bail out.
@@ -580,13 +597,13 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- FINAL CONFIRMATION GATE ---
+    // --- FINAL CONFIRMATION GATE (kept for safety, but closing is clean) ---
     if (mergedSlots.confirmation_pending === true) {
       if (isAffirmation(speech) && !isNegation(speech)) {
         mergedSlots.confirmation_pending = false;
         const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.";
         return res.status(200).json({
-          reply: "Great—thanks. You’re all set.",
+          reply: "", // no redundant “You’re all set.”
           slots: mergedSlots,
           done: true,
           goodbye: bye,
@@ -757,12 +774,23 @@ export default async function handler(req, res) {
       });
     }
 
-    // NEW: “Yes” to a yes/no question should advance the flow
+    // NEW: “No” to a yes/no question → repeat the same question (do not advance)
     const priorLastQuestion = getLastAssistantQuestion(history) || '';
     const lastQ = lastQuestion || priorLastQuestion;
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending) {
+      if (isNegation(speech) && isYesNoQuestion(lastQ)) {
+        return res.status(200).json({
+          reply: enforceHVACBranding(`No problem—let’s try that again. ${lastQ}`),
+          slots: mergedSlots,
+          done: false,
+          goodbye: null,
+          needs_confirmation: false,
+          model: 'gpt-4o-mini',
+          usage: null,
+        });
+      }
+      // “Yes” to a yes/no question should advance
       if (isAffirmation(speech) && isYesNoQuestion(lastQ)) {
-        // apply any semantic effects of the yes
         if (/call[- ]ahead/i.test(lastQ)) mergedSlots.call_ahead = true;
         if (/shall we proceed|price|diagnostic|\$\s*\d+/i.test(lastQ)) mergedSlots.pricing_disclosed = true;
 
@@ -917,23 +945,25 @@ export default async function handler(req, res) {
     // done?
     const serverDone = serverSideDoneCheck(mergedSlots);
 
-    let needs_confirmation = false;
-    let replyOut = parsed.reply;
     if (serverDone) {
-      // Boss request: no spoken summary; just a short confirmation
-      replyOut = 'Is everything correct? If not, please tell me what to change.';
-      needs_confirmation = true;
-      mergedSlots.confirmation_pending = true;
+      // Close cleanly: no summary, no final confirmation prompt.
+      return res.status(200).json({
+        reply: "", // no extra “all set” pre-roll
+        slots: mergedSlots,
+        done: true,
+        goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.",
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: data?.usage ?? null,
+      });
     }
 
     return res.status(200).json({
-      reply: replyOut,
+      reply: parsed.reply,
       slots: mergedSlots,
-      done: serverDone && !needs_confirmation,
-      goodbye: serverDone && !needs_confirmation
-        ? (parsed.goodbye || "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.")
-        : null,
-      needs_confirmation,
+      done: false,
+      goodbye: null,
+      needs_confirmation: false,
       model: 'gpt-4o-mini',
       usage: data?.usage ?? null,
     });

@@ -19,9 +19,17 @@ function baseUrlFromReq(req) {
   return `${proto}://${host}`;
 }
 
+// Ensure the brand is pronounced like the intro everywhere it’s spoken.
+function pronounceBrandForTTS(text = '') {
+  if (!text) return text;
+  // Collapse variants (HVAC/H.V.A.C) to the spaced “H. V. A. C Joy” for TTS
+  return text.replace(/\bH\.?\s*V\.?\s*A\.?\s*C\.?\s+Joy\b/gi, 'H. V. A. C Joy');
+}
+
 // Used by <Play> everywhere (intro included)
 function ttsUrlAbsolute(baseUrl, text, voice) {
-  const params = new URLSearchParams({ text });
+  const spoken = pronounceBrandForTTS(text || '');
+  const params = new URLSearchParams({ text: spoken });
   if (voice) params.set('voice', voice); // /api/tts can also default
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
@@ -92,6 +100,8 @@ async function getLastAssistantQuestion(supabase, callSid) {
 function isUnclear(text = '') {
   const t = (text || '').trim().toLowerCase();
   if (!t) return true;
+  // Short confirmations/denials are clear (don’t treat as noise)
+  if (/^(yes|no|ok|okay|yeah|yep|nope|correct|that'?s (right|correct))$/i.test(t)) return false;
   if (t.length <= 2) return true;
   if (/\b(play|he told|audio|uh|umm?|hmm?)\b/.test(t)) return true;
   return false;
@@ -111,6 +121,7 @@ function makeGoodbyeFromSlots(slots = {}) {
   const callAheadBit = (slots.call_ahead === false)
     ? ' We will arrive within your window without a call-ahead.'
     : ' We will call ahead before arriving.';
+  // Keep brand mention out here; chat.js may provide a branded goodbye already.
   return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit} Goodbye.`;
 }
 
@@ -123,8 +134,6 @@ function normalizeCallAheadInText(text = '', slots = {}) {
 }
 
 // ---------- Sympathy helpers ----------
-// Single-line, case-insensitive regex (works with Node/JS). Covers:
-// "not blowing cold/cool", "no cool air", "not cooling", "AC broke", etc.
 const PROBLEM_RE = /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|(not\s+(?:blow|blowing)\s+(?:cold|cool)|no\s+(?:cold|cool)\s+air)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac)|\bvery\s+(hot|cold)\b|burning up|freezing)/i;
 
 function detectedProblem(text = '') {
@@ -140,9 +149,9 @@ function maybeAddEmpathyOnFallback(userText, reply) {
   return reply;
 }
 
-// Common <Gather> attributes
+// Common <Gather> attributes (added “no/nope/incorrect” and spoken digits help)
 function gatherAttrs(actionUrl) {
-  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
+  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, no, nope, not correct, incorrect, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
 }
 
 // ---------- Handler ----------
@@ -273,7 +282,7 @@ export default async function handler(req, res) {
 
       if (resp?.ok) {
         const data = await resp.json();
-        if (data?.reply) reply = String(data.reply);
+        if (data?.reply !== undefined) reply = String(data.reply || '');
         if (data && typeof data.slots === 'object') slots = data.slots;
         if (typeof data?.done === 'boolean') done = data.done;
         if (typeof data?.goodbye === 'string') goodbye = data.goodbye;
@@ -298,29 +307,24 @@ export default async function handler(req, res) {
     await logTurn({ supabase, caller: from, callSid, text: reply, role: 'assistant', meta });
 
     if (done) {
-      const replyUrl = ttsUrlAbsolute(baseUrl, reply, SELECTED_VOICE);
-      const byeText = (goodbye && goodbye.trim()) ? goodbye : makeGoodbyeFromSlots(slots);
-      const byeUrl = ttsUrlAbsolute(baseUrl, byeText, SELECTED_VOICE);
+      const byeText = (goodbye && goodbye.trim())
+        ? goodbye
+        : makeGoodbyeFromSlots(slots);
 
-      if (needs_confirmation) {
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${replyUrl}</Play>
-  <Pause length="1"/>
-  <Gather ${gatherAttrs(actionUrl)}/>
-  <Redirect method="POST">${actionUrl}</Redirect>
-</Response>`;
-        return sendXml(res, twiml);
-      } else {
-        const twiml = `<?xml version="1.0" encoding="UTF-8"?>
-<Response>
-  <Play>${replyUrl}</Play>
-  <Pause length="1"/>
-  <Play>${byeUrl}</Play>
-  <Hangup/>
-</Response>`;
-        return sendXml(res, twiml);
+      // Build TwiML: only play reply if non-empty, then play goodbye.
+      const parts = [];
+      parts.push('<?xml version="1.0" encoding="UTF-8"?>');
+      parts.push('<Response>');
+      if (trimmed) {
+        const replyUrl = ttsUrlAbsolute(baseUrl, reply, SELECTED_VOICE);
+        parts.push(`  <Play>${replyUrl}</Play>`);
+        parts.push('  <Pause length="1"/>');
       }
+      const byeUrl = ttsUrlAbsolute(baseUrl, byeText, SELECTED_VOICE);
+      parts.push(`  <Play>${byeUrl}</Play>`);
+      parts.push('  <Hangup/>');
+      parts.push('</Response>');
+      return sendXml(res, parts.join('\n'));
     }
 
     const replyUrl = ttsUrlAbsolute(baseUrl, reply, SELECTED_VOICE);
