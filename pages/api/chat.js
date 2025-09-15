@@ -603,7 +603,7 @@ export default async function handler(req, res) {
         mergedSlots.confirmation_pending = false;
         const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.";
         return res.status(200).json({
-          reply: "", // no redundant “You’re all set.”
+          reply: "",
           slots: mergedSlots,
           done: true,
           goodbye: bye,
@@ -906,9 +906,9 @@ export default async function handler(req, res) {
       }
     }
 
-    // pricing must precede scheduling
-    if (mergedSlots.pricing_disclosed !== true &&
-        /(?:schedule|book|calendar|what day works|time window|morning|afternoon|flexible)/i.test(parsed.reply || '')) {
+    // pricing must precede scheduling (broader detection)
+    const schedHint = /\b(schedule|book|calendar|appointment|appt|date|what (?:date|day)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next (?:mon|tue|wed|thu|fri|sat|sun)|time window|morning|afternoon|flexible)\b/i;
+    if (mergedSlots.pricing_disclosed !== true && schedHint.test(parsed.reply || '')) {
       parsed.reply = `${priceLine} Shall we proceed?`;
     }
 
@@ -948,7 +948,7 @@ export default async function handler(req, res) {
     if (serverDone) {
       // Close cleanly: no summary, no final confirmation prompt.
       return res.status(200).json({
-        reply: "", // no extra “all set” pre-roll
+        reply: "",
         slots: mergedSlots,
         done: true,
         goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.",

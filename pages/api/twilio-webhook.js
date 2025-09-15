@@ -240,10 +240,13 @@ export default async function handler(req, res) {
         .select('role, meta, text, turn_index')
         .eq('call_sid', callSid)
         .order('turn_index', { ascending: false })
-        .limit(12);
+        .limit(40); // look farther back
 
       const lastAssistantWithSlots = (lastTurns || []).find(
-        t => t.role === 'assistant' && t?.meta?.slots
+        t =>
+          t.role === 'assistant' &&
+          t?.meta?.slots &&
+          Object.keys(t.meta.slots || {}).length > 0 // ignore empty slot objects
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
