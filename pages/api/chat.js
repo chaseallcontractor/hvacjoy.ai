@@ -1,7 +1,7 @@
 /* eslint-disable */
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
-import { insertCalendarEvent } from '../../lib/google-calendar'; // <-- NEW
+import { insertCalendarEvent } from '../../lib/google-calendar'; // <-- calendar insert
 
 // Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
@@ -125,7 +125,7 @@ async function fetchHistoryMessages(callSid) {
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
       content: r.text || ''
-    }));
+    })); 
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
     return [];
@@ -493,7 +493,7 @@ function serverSideDoneCheck(slots) {
   );
 }
 
-// --- NEW: map preferred window to start/end times for calendar ---
+// --- Map preferred window to start/end times for calendar ---
 function windowToTimes(dateISO, window, tz) {
   const d = (dateISO || '').slice(0, 10); // YYYY-MM-DD
   const start = window === 'afternoon' ? `${d}T13:00:00` : `${d}T09:00:00`;
@@ -610,7 +610,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // --- FINAL CONFIRMATION GATE (kept for safety, but closing is clean) ---
+    // --- FINAL CONFIRMATION GATE ---
     if (mergedSlots.confirmation_pending === true) {
       if (isAffirmation(speech) && !isNegation(speech)) {
         mergedSlots.confirmation_pending = false;
@@ -959,7 +959,7 @@ export default async function handler(req, res) {
     const serverDone = serverSideDoneCheck(mergedSlots);
 
     if (serverDone) {
-      // NEW: Create the calendar event before ending the call
+      // Create the calendar event before ending the call
       try {
         const s = mergedSlots || {};
         const addr = s.service_address || {};
@@ -972,7 +972,7 @@ export default async function handler(req, res) {
           s.brand ? `Brand: ${s.brand}` : null,
           (s.thermostat && s.thermostat.setpoint != null && s.thermostat.current != null)
             ? `Thermostat: set ${s.thermostat.setpoint}, current ${s.thermostat.current}` : null,
-          s.symptoms?.length ? `Symptoms: ${s.symptoms.join(', ')}` : null,
+          Array.isArray(s.symptoms) && s.symptoms.length ? `Symptoms: ${s.symptoms.join(', ')}` : null,
           s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
         ].filter(Boolean).join('\n');
 
@@ -1003,7 +1003,7 @@ export default async function handler(req, res) {
         goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.",
         needs_confirmation: false,
         model: 'gpt-4o-mini',
-        usage: data?.usage ?? null,
+        usage: null,
       });
     }
 
@@ -1014,7 +1014,7 @@ export default async function handler(req, res) {
       goodbye: null,
       needs_confirmation: false,
       model: 'gpt-4o-mini',
-      usage: data?.usage ?? null,
+      usage: null,
     });
   } catch (err) {
     console.error('chat handler error', err);
