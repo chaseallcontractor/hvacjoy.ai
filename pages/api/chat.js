@@ -1,6 +1,7 @@
 /* eslint-disable */
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
+import { insertCalendarEvent } from '../../lib/google-calendar'; // <-- NEW
 
 // Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
@@ -269,7 +270,7 @@ function parseFullAddress(line) {
     };
   }
 
-  // Fallback: **no street-suffix requirement** (handles ASR “Wok” vs “Walk”)
+  // Fallback: **no street-suffix requirement**
   re = new RegExp(
     `\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?)\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
@@ -490,6 +491,18 @@ function serverSideDoneCheck(slots) {
     !!s.preferred_date &&
     !!s.preferred_window
   );
+}
+
+// --- NEW: map preferred window to start/end times for calendar ---
+function windowToTimes(dateISO, window, tz) {
+  const d = (dateISO || '').slice(0, 10); // YYYY-MM-DD
+  const start = window === 'afternoon' ? `${d}T13:00:00` : `${d}T09:00:00`;
+  const end   = window === 'afternoon' ? `${d}T14:00:00` : `${d}T10:00:00`;
+  const timeZone = tz || process.env.DEFAULT_TZ || 'America/New_York';
+  return {
+    start: { dateTime: start, timeZone },
+    end:   { dateTime: end,   timeZone },
+  };
 }
 
 // ---- Address progress: accept ONLY a complete, one-line address
@@ -946,6 +959,42 @@ export default async function handler(req, res) {
     const serverDone = serverSideDoneCheck(mergedSlots);
 
     if (serverDone) {
+      // NEW: Create the calendar event before ending the call
+      try {
+        const s = mergedSlots || {};
+        const addr = s.service_address || {};
+        const title = `HVAC Joy – ${s.full_name || 'Service Call'}`;
+        const location = [addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ');
+        const description = [
+          `Callback: ${s.callback_number || 'N/A'}`,
+          s.unit_count != null ? `Units: ${s.unit_count}` : null,
+          s.unit_locations ? `Locations: ${s.unit_locations}` : null,
+          s.brand ? `Brand: ${s.brand}` : null,
+          (s.thermostat && s.thermostat.setpoint != null && s.thermostat.current != null)
+            ? `Thermostat: set ${s.thermostat.setpoint}, current ${s.thermostat.current}` : null,
+          s.symptoms?.length ? `Symptoms: ${s.symptoms.join(', ')}` : null,
+          s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
+        ].filter(Boolean).join('\n');
+
+        const { start, end } = windowToTimes(
+          s.preferred_date,
+          s.preferred_window,
+          process.env.DEFAULT_TZ
+        );
+
+        await insertCalendarEvent(process.env.GOOGLE_CALENDAR_ID, {
+          summary: title,
+          location,
+          description,
+          start,
+          end,
+          reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 30 }] },
+        });
+      } catch (e) {
+        console.error('Calendar insert failed:', e?.response?.data || e);
+        // even if calendar insert fails, we still finish the call cleanly
+      }
+
       // Close cleanly: no summary, no final confirmation prompt.
       return res.status(200).json({
         reply: "",
