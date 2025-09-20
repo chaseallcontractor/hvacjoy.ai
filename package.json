@@ -9,8 +9,10 @@
     "lint": "next lint"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.56.0",
+    "@supabase/supabase-js": "^2.57.4",
+    "googleapis": "^159.0.0",
     "next": "15.4.6",
+    "open": "^10.2.0",
     "react": "19.1.0",
     "react-dom": "19.1.0",
     "twilio": "^5.8.0"
