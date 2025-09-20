@@ -1,7 +1,8 @@
 /* eslint-disable */
 // pages/api/chat.js
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
-import { insertCalendarEvent } from '../../lib/google-calendar'; // <-- calendar insert
+import { insertCalendarEvent } from '../../lib/google-calendar.js';
+
 
 // Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
