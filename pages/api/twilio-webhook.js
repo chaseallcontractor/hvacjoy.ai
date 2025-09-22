@@ -4,8 +4,9 @@ import { getSupabaseAdmin } from '../../lib/supabase-admin';
 
 export const config = { api: { bodyParser: false } };
 
-// Use a single selected voice everywhere (passed through to /api/tts)
+// Voice + timezone (Georgia defaults to Eastern Time)
 const SELECTED_VOICE = process.env.TTS_VOICE || null;
+const DEFAULT_TZ = process.env.DEFAULT_TZ || 'America/New_York';
 
 function sendXml(res, twiml) {
   res.setHeader('Content-Type', 'text/xml');
@@ -32,6 +33,21 @@ function ttsUrlAbsolute(baseUrl, text, voice) {
   const params = new URLSearchParams({ text: spoken });
   if (voice) params.set('voice', voice); // /api/tts can also default
   return `${baseUrl}/api/tts?${params.toString()}`;
+}
+
+// Pretty formatter for confirmations/goodbyes (ET-safe)
+function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
+  if (!dateISO) return '';
+  const [y, m, d] = dateISO.split('-').map(Number);
+  const [hh = 0, mm = 0] = (timeHHMM || '00:00').split(':').map(Number);
+  // Build a UTC instant representing the local time in tz
+  const base = new Date(Date.UTC(y, m - 1, d, hh, mm));
+  const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(base);
+  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', day: 'numeric' }).format(base);
+  const timePart = timeHHMM
+    ? new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(base)
+    : null;
+  return timePart ? `${weekday}, ${monthDay} at ${timePart}` : `${weekday}, ${monthDay}`;
 }
 
 // ---------- DB logging ----------
@@ -114,14 +130,12 @@ function userSaysWeAreScheduling(text = '') {
 // ---------- Call-ahead helpers ----------
 function makeGoodbyeFromSlots(slots = {}) {
   const firstName = (slots.full_name || '').split(' ')[0] || '';
-  const date = slots.preferred_date ? String(slots.preferred_date) : '';
-  const window = slots.preferred_window ? ` in the ${slots.preferred_window} window` : '';
-  const when = date ? ` on ${date}${window}` : (window || '');
+  const pretty = formatPretty(slots.preferred_date, slots.preferred_time || null, DEFAULT_TZ);
+  const when = pretty ? ` on ${pretty}` : '';
   const nameBit = firstName ? `, ${firstName}` : '';
   const callAheadBit = (slots.call_ahead === false)
     ? ' We will arrive within your window without a call-ahead.'
     : ' We will call ahead before arriving.';
-  // Keep brand mention out here; chat.js may provide a branded goodbye already.
   return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit} Goodbye.`;
 }
 
@@ -190,7 +204,7 @@ export default async function handler(req, res) {
 
       await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
-      const welcome = 'Welcome to Smith Heating & Air . I am your digital assistant Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
+      const welcome = 'Welcome to Smith Heating & Air. I am your digital assistant Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
       const exampleUrl = ttsUrlAbsolute(baseUrl, example, SELECTED_VOICE);
       const didntCatchUrl = ttsUrlAbsolute(
@@ -240,13 +254,13 @@ export default async function handler(req, res) {
         .select('role, meta, text, turn_index')
         .eq('call_sid', callSid)
         .order('turn_index', { ascending: false })
-        .limit(40); // look farther back
+        .limit(40);
 
       const lastAssistantWithSlots = (lastTurns || []).find(
         t =>
           t.role === 'assistant' &&
           t?.meta?.slots &&
-          Object.keys(t.meta.slots || {}).length > 0 // ignore empty slot objects
+          Object.keys(t.meta.slots || {}).length > 0
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
@@ -266,7 +280,7 @@ export default async function handler(req, res) {
     } catch (_) {}
 
     const CHAT_TIMEOUT_MS = parseInt(process.env.CHAT_TIMEOUT_MS || '12000', 10);
-    const t = withTimeout(CHAT_TIMEOUT_MS);
+    const controller = withTimeout(CHAT_TIMEOUT_MS);
 
     let reply = 'One moment.';
     let slots = lastSlots;
@@ -279,9 +293,9 @@ export default async function handler(req, res) {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ caller: from, speech, callSid, lastSlots, lastQuestion }),
-        signal: t.signal,
+        signal: controller.signal,
       }).catch(e => { throw e; })
-        .finally(() => t.cancel());
+        .finally(() => controller.cancel());
 
       if (resp?.ok) {
         const data = await resp.json();
@@ -314,7 +328,6 @@ export default async function handler(req, res) {
         ? goodbye
         : makeGoodbyeFromSlots(slots);
 
-      // Build TwiML: only play reply if non-empty, then play goodbye.
       const parts = [];
       parts.push('<?xml version="1.0" encoding="UTF-8"?>');
       parts.push('<Response>');

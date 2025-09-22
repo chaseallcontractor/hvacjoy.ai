@@ -3,6 +3,8 @@
 import { getSupabaseAdmin } from '../../lib/supabase-admin';
 import { insertCalendarEvent } from '../../lib/google-calendar.js';
 
+// --- Timezone (Georgia/Eastern by default) ---
+const DEFAULT_TZ = process.env.DEFAULT_TZ || 'America/New_York';
 
 // Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
@@ -41,7 +43,7 @@ Call Flow
    - Thermostat setpoint and current reading
 4) Pricing disclosure before scheduling.
 5) Scheduling:
-   - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
+   - Offer earliest availability; **ask for a date**, then arrival window + call-ahead, **or accept a specific time**.
    - If caller is flexible all day, note "flexible_all_day."
 6) Membership check (after booking).
 7) Confirm politely (no long read-back).
@@ -81,7 +83,8 @@ slots schema:
   "symptoms": [],
   "thermostat": { "setpoint": null | "<string|number>", "current": null | "<string|number>" },
   "membership_status": null | "member" | "non_member" | "unknown",
-  "preferred_date": null | "<ISO or natural language>",
+  "preferred_date": null | "<YYYY-MM-DD or natural language>",
+  "preferred_time": null | "<HH:MM 24h>",
   "preferred_window": null | "morning" | "afternoon" | "flexible_all_day" | "<time window>",
   "call_ahead": null | true | false,
   "hazards_pets_ants_notes": null | "<string>",
@@ -101,7 +104,7 @@ Behavior
 - Continue the call. Do not repeat the greeting (“Welcome to H.V.A.C Joy…”).
 - Do NOT ask again for any slot already non-null in "known slots".
 - Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
-- Require a date for booking (not only a window). Ask for date first, then window.
+- Require a date for booking (not only a window). Ask for date first, then window **unless a specific time was provided**.
 - If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
 - When done is reached, do NOT read any summary and do NOT ask “Is everything correct?” — simply close politely.
 `.trim();
@@ -369,6 +372,99 @@ function parsePhone(text) {
   return { partial: digits, complete: false };
 }
 
+// ----------------- Natural language date/time -----------------
+function nowInTZ(tz = DEFAULT_TZ) {
+  // Build a Date using formatted parts in the target TZ to avoid server-local drift
+  const fmt = new Intl.DateTimeFormat('en-US', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }).formatToParts(new Date());
+  const get = (t) => Number(fmt.find(p => p.type === t)?.value || 0);
+  // Months are 1-based in parts
+  return new Date(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'));
+}
+const WEEKDAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+function nextWeekdayDate(base, targetName) {
+  const name = targetName.toLowerCase();
+  const target = WEEKDAYS.indexOf(name);
+  if (target < 0) return null;
+  const d = new Date(base.getTime());
+  const diff = (target - d.getDay() + 7) % 7 || 7; // always future date
+  d.setDate(d.getDate() + diff);
+  return d;
+}
+function two(n){ return String(n).padStart(2,'0'); }
+
+function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
+  const t = (text || '').toLowerCase();
+
+  const base = nowInTZ(tz);
+  let date = null;
+  let time = null;
+  let inferredWindow = null;
+
+  // date: "tomorrow"
+  if (/\btomorrow\b/.test(t)) {
+    const d = new Date(base.getTime());
+    d.setDate(d.getDate() + 1);
+    date = d;
+  }
+
+  // date: weekday ("friday", "next tuesday")
+  const wd = t.match(/\b(next\s+)?(sunday|monday|tuesday|wednesday|thursday|friday|saturday)\b/i);
+  if (wd) {
+    const target = wd[2];
+    const d = nextWeekdayDate(base, target);
+    if (d) date = d;
+  }
+
+  // time phrases
+  if (/\bnoon\b/.test(t)) time = { hh: 12, mm: 0 };
+  if (/\bmidnight\b/.test(t)) time = { hh: 0, mm: 0 };
+
+  // e.g., "2 pm", "2:30pm", "14:15"
+  if (!time) {
+    const m = t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+    if (m) {
+      let hh = Number(m[1]);
+      let mm = Number(m[2] || 0);
+      const ap = m[3] || null;
+      if (ap === 'pm' && hh < 12) hh += 12;
+      if (ap === 'am' && hh === 12) hh = 0;
+      if (!ap && hh <= 24) {
+        // 24h style like "14:00"
+        if (hh === 24) hh = 0;
+      }
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+        time = { hh, mm };
+      }
+    }
+  }
+
+  // If user said "morning/afternoon" without a time, capture window
+  const win = inferPreferredWindowFrom(t);
+  if (win) inferredWindow = win;
+
+  if (!date && (time || inferredWindow)) {
+    // If only time/window, assume "today" if still in future; else tomorrow
+    const maybe = new Date(base.getTime());
+    if (time) { maybe.setHours(time.hh, time.mm, 0, 0); }
+    else if (inferredWindow === 'morning') { maybe.setHours(9, 0, 0, 0); }
+    else if (inferredWindow === 'afternoon') { maybe.setHours(13, 0, 0, 0); }
+    date = (maybe > base) ? maybe : new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
+  }
+
+  if (!date && !time && !inferredWindow) return null;
+
+  const y = date ? date.getFullYear() : base.getFullYear();
+  const m = date ? date.getMonth() + 1 : base.getMonth() + 1;
+  const d = date ? date.getDate() : base.getDate();
+  const dateISO = `${y}-${two(m)}-${two(d)}`;
+  const timeHHMM = time ? `${two(time.hh)}:${two(time.mm)}` : null;
+
+  return { dateISO, timeHHMM, inferredWindow };
+}
+
 // ----------------- Detectors & cleaners ------------------
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
@@ -406,7 +502,7 @@ function stripRepeatedGreeting(history, reply) {
   return reply.replace(/^\s*welcome to h\.?v\.?a\.?c\.?\s+joy.*?(?:\.\s*|\s*$)/i, '').trim();
 }
 function suppressMembershipUntilBooked(reply, slots) {
-  const booked = !!(slots.preferred_window && slots.preferred_date);
+  const booked = !!(slots.preferred_date && (slots.preferred_window || slots.preferred_time));
   if (!booked && /member|maintenance program/i.test(reply)) {
     return 'Great—thanks. Let’s finish your booking first.';
   }
@@ -426,7 +522,10 @@ function nextMissingPrompt(s) {
   }
   if (s.pricing_disclosed !== true) return `${priceLine} Shall we proceed?`;
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
-  if (!s.preferred_window) return 'What time window works for you—morning, afternoon, or flexible all day?';
+  // If a **specific time** exists, we don't require a window.
+  if (!s.preferred_time && !s.preferred_window) {
+    return 'What time window works for you—morning, afternoon, or flexible all day?';
+  }
   return null;
 }
 function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
@@ -490,7 +589,7 @@ function serverSideDoneCheck(slots) {
     !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
     s.pricing_disclosed === true &&
     !!s.preferred_date &&
-    !!s.preferred_window
+    (!!s.preferred_window || !!s.preferred_time)
   );
 }
 
@@ -499,6 +598,20 @@ function windowToTimes(dateISO, window, tz) {
   const d = (dateISO || '').slice(0, 10); // YYYY-MM-DD
   const start = window === 'afternoon' ? `${d}T13:00:00` : `${d}T09:00:00`;
   const end   = window === 'afternoon' ? `${d}T14:00:00` : `${d}T10:00:00`;
+  const timeZone = tz || process.env.DEFAULT_TZ || 'America/New_York';
+  return {
+    start: { dateTime: start, timeZone },
+    end:   { dateTime: end,   timeZone },
+  };
+}
+
+function timeToTimes(dateISO, timeHHMM, tz) {
+  const d = (dateISO || '').slice(0, 10);
+  const start = `${d}T${timeHHMM || '09:00'}:00`;
+  // default 60-minute slot
+  const [hh, mm] = (timeHHMM || '09:00').split(':').map(Number);
+  const endH = String((hh + 1) % 24).padStart(2, '0');
+  const end = `${d}T${endH}:${String(mm).padStart(2,'0')}:00`;
   const timeZone = tz || process.env.DEFAULT_TZ || 'America/New_York';
   return {
     start: { dateTime: start, timeZone },
@@ -774,6 +887,16 @@ export default async function handler(req, res) {
       });
     }
 
+    // ---- Natural-language date/time capture (e.g., "tomorrow at 2 pm", "Friday at noon")
+    const parsedDT = parseNaturalDateTime(speech, DEFAULT_TZ);
+    if (parsedDT) {
+      if (!mergedSlots.preferred_date) mergedSlots.preferred_date = parsedDT.dateISO;
+      if (parsedDT.timeHHMM && !mergedSlots.preferred_time) mergedSlots.preferred_time = parsedDT.timeHHMM;
+      if (parsedDT.inferredWindow && !mergedSlots.preferred_window && !mergedSlots.preferred_time) {
+        mergedSlots.preferred_window = parsedDT.inferredWindow;
+      }
+    }
+
     // ---- Continue / move on → next missing
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
@@ -900,7 +1023,7 @@ export default async function handler(req, res) {
     }
 
     // heuristics
-    if (!mergedSlots.preferred_window) {
+    if (!mergedSlots.preferred_window && !mergedSlots.preferred_time) {
       const win = inferPreferredWindowFrom(speech);
       if (win) mergedSlots.preferred_window = win;
     }
@@ -921,7 +1044,7 @@ export default async function handler(req, res) {
     }
 
     // pricing must precede scheduling (broader detection)
-    const schedHint = /\b(schedule|book|calendar|appointment|appt|date|what (?:date|day)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next (?:mon|tue|wed|thu|fri|sat|sun)|time window|morning|afternoon|flexible)\b/i;
+    const schedHint = /\b(schedule|book|calendar|appointment|appt|date|what (?:date|day)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next (?:mon|tue|wed|thu|fri|sat|sun)|time window|morning|afternoon|flexible|at \d|am|pm|noon|midnight)\b/i;
     if (mergedSlots.pricing_disclosed !== true && schedHint.test(parsed.reply || '')) {
       parsed.reply = `${priceLine} Shall we proceed?`;
     }
@@ -977,18 +1100,19 @@ export default async function handler(req, res) {
           s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
         ].filter(Boolean).join('\n');
 
-        const { start, end } = windowToTimes(
-          s.preferred_date,
-          s.preferred_window,
-          process.env.DEFAULT_TZ
-        );
+        let startEnd;
+        if (s.preferred_time) {
+          startEnd = timeToTimes(s.preferred_date, s.preferred_time, DEFAULT_TZ);
+        } else {
+          startEnd = windowToTimes(s.preferred_date, s.preferred_window, DEFAULT_TZ);
+        }
 
         await insertCalendarEvent(process.env.GOOGLE_CALENDAR_ID, {
           summary: title,
           location,
           description,
-          start,
-          end,
+          start: startEnd.start,
+          end: startEnd.end,
           reminders: { useDefault: false, overrides: [{ method: 'popup', minutes: 30 }] },
         });
       } catch (e) {
