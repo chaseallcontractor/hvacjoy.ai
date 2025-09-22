@@ -599,7 +599,7 @@ export default async function handler(req, res) {
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
 
     // --- EMERGENCY FAST-PATH ---
-    if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell)\b/i.test(speech || '')) {
+    if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell|smoke)\b/i.test(speech || '')) {
       return res.status(200).json({
         reply: "If you suspect a safety issue, please hang up and call 911 now. I’ll also alert our dispatcher immediately. Are you safe to continue?",
         slots: mergedSlots,
