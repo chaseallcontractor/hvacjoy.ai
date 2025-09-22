@@ -615,7 +615,7 @@ export default async function handler(req, res) {
     if (mergedSlots.confirmation_pending === true) {
       if (isAffirmation(speech) && !isNegation(speech)) {
         mergedSlots.confirmation_pending = false;
-        const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.";
+        const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing Smith Heating & Air. Goodbye.";
         return res.status(200).json({
           reply: "",
           slots: mergedSlots,
@@ -1001,7 +1001,7 @@ export default async function handler(req, res) {
         reply: "",
         slots: mergedSlots,
         done: true,
-        goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing H.V.A.C Joy. Goodbye.",
+        goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing Smith Heating & Air. Goodbye.",
         needs_confirmation: false,
         model: 'gpt-4o-mini',
         usage: null,
