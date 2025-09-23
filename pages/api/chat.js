@@ -43,7 +43,8 @@ Call Flow
    - Thermostat setpoint and current reading
 4) Pricing disclosure before scheduling.
 5) Scheduling:
-   - Offer earliest availability; **ask for a date**, then arrival window + call-ahead, **or accept a specific time**.
+   - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
+   - If the caller provides a **specific time**, accept it instead of a window.
    - If caller is flexible all day, note "flexible_all_day."
 6) Membership check (after booking).
 7) Confirm politely (no long read-back).
@@ -104,7 +105,7 @@ Behavior
 - Continue the call. Do not repeat the greeting (“Welcome to H.V.A.C Joy…”).
 - Do NOT ask again for any slot already non-null in "known slots".
 - Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
-- Require a date for booking (not only a window). Ask for date first, then window **unless a specific time was provided**.
+- Require a date for booking. Ask for date first, then window **unless a specific time was provided**.
 - If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
 - When done is reached, do NOT read any summary and do NOT ask “Is everything correct?” — simply close politely.
 `.trim();
@@ -619,6 +620,21 @@ function timeToTimes(dateISO, timeHHMM, tz) {
   };
 }
 
+// --- Pretty, human-friendly date/time for confirmations ---
+function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
+  if (!dateISO) return '';
+  const [y, m, d] = dateISO.split('-').map(Number);
+  const [hh = 0, mm = 0] = (timeHHMM || '00:00').split(':').map(Number);
+  // Use UTC base and let Intl render in target tz
+  const base = new Date(Date.UTC(y, m - 1, d, hh, mm));
+  const weekday  = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(base);
+  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', day: 'numeric' }).format(base);
+  const timePart = timeHHMM
+    ? new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(base)
+    : null;
+  return timePart ? `${weekday}, ${monthDay} at ${timePart}` : `${weekday}, ${monthDay}`;
+}
+
 // ---- Address progress: accept ONLY a complete, one-line address
 function handleAddressProgress_STRICT(speech, slots) {
   const s = { ...(slots || {}) };
@@ -948,7 +964,7 @@ export default async function handler(req, res) {
     const steering =
       'Continue the call. Do not repeat the greeting.' +
       '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
-      '\nRequire a date for booking. Ask for date first, then time window.' +
+      '\nRequire a date for booking. Ask for date first, then time window. If the caller provides a specific time, accept it instead of a window.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
       '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
       (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
@@ -1120,12 +1136,21 @@ export default async function handler(req, res) {
         // even if calendar insert fails, we still finish the call cleanly
       }
 
-      // Close cleanly: no summary, no final confirmation prompt.
+      // Close cleanly: speak schedule line + call-ahead, then brand closing.
+      const s = mergedSlots || {};
+      const pretty = formatPretty(s.preferred_date, s.preferred_time || null, DEFAULT_TZ);
+      const windowNote = (!s.preferred_time && s.preferred_window) ? ` in the ${s.preferred_window} window` : '';
+      const whenLine = pretty ? `You’re scheduled for ${pretty}${windowNote}.` : 'Your appointment is scheduled.';
+      const callAheadBit = (s.call_ahead === false)
+        ? ' We will arrive within your window without a call-ahead.'
+        : ' We’ll call ahead before arriving.';
+      const goodbyeLine = `${whenLine}${callAheadBit} Thank you for calling Smith Heating & Air. Goodbye.`;
+
       return res.status(200).json({
         reply: "",
         slots: mergedSlots,
         done: true,
-        goodbye: "You’re set. We’ll call ahead before arriving. Thank you for choosing Smith Heating & Air. Goodbye.",
+        goodbye: goodbyeLine,
         needs_confirmation: false,
         model: 'gpt-4o-mini',
         usage: null,
