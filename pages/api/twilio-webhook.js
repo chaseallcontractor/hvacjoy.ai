@@ -35,18 +35,27 @@ function ttsUrlAbsolute(baseUrl, text, voice) {
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
-// Pretty formatter for confirmations/goodbyes (ET-safe)
+// Pretty formatter for confirmations/goodbyes — TZ-safe & preserves wall-clock time
 function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
   if (!dateISO) return '';
+
   const [y, m, d] = dateISO.split('-').map(Number);
-  const [hh = 0, mm = 0] = (timeHHMM || '00:00').split(':').map(Number);
-  // Build a UTC instant representing the local time in tz
-  const base = new Date(Date.UTC(y, m - 1, d, hh, mm));
-  const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(base);
-  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', day: 'numeric' }).format(base);
-  const timePart = timeHHMM
-    ? new Intl.DateTimeFormat('en-US', { timeZone: tz, hour: 'numeric', minute: '2-digit' }).format(base)
-    : null;
+
+  // Anchor at noon UTC so the *date* renders correctly in the target TZ,
+  // without interpreting the provided time as UTC (which causes a shift).
+  const anchor = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
+
+  const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(anchor);
+  const monthDay = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', day: 'numeric' }).format(anchor);
+
+  let timePart = null;
+  if (timeHHMM) {
+    const [hh, mm] = timeHHMM.split(':').map(Number);
+    const h12 = ((hh % 12) || 12);
+    const ampm = hh < 12 ? 'AM' : 'PM';
+    timePart = `${h12}:${String(mm).padStart(2, '0')} ${ampm}`;
+  }
+
   return timePart ? `${weekday}, ${monthDay} at ${timePart}` : `${weekday}, ${monthDay}`;
 }
 
