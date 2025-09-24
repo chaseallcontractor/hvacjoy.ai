@@ -396,8 +396,13 @@ function nextWeekdayDate(base, targetName) {
 }
 function two(n){ return String(n).padStart(2,'0'); }
 
+// >>> Hardened parser to avoid "2 units" => 02:00 and require scheduling intent
 function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   const t = (text || '').toLowerCase();
+
+  // Require scheduling intent before inferring a date from a time/window
+  const schedulingIntentRe = /\b(schedule|scheduling|book|booking|calendar|appointment|appt|visit|tomorrow|today|this (?:morning|afternoon|evening|week)|next (?:sun|mon|tue|wed|thu|fri|sat)|on (?:sunday|monday|tuesday|wednesday|thursday|friday|saturday))\b/;
+  const hasSchedulingIntent = schedulingIntentRe.test(t);
 
   const base = nowInTZ(tz);
   let date = null;
@@ -419,35 +424,35 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
     if (d) date = d;
   }
 
-  // time phrases
-  if (/\bnoon\b/.test(t)) time = { hh: 12, mm: 0 };
-  if (/\bmidnight\b/.test(t)) time = { hh: 0, mm: 0 };
+  // time phrases with clear signals ONLY
+  // Accept: "at 2", "at 2 pm", "at 2:30pm", "2:30", "14:15", "2 pm", "11am"
+  let m = t.match(/\bat\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
+  if (!m) m = t.match(/\b(\d{1,2}):(\d{2})\b/);
+  if (!m) m = t.match(/\b(\d{1,2})\s*(am|pm)\b/);
 
-  // e.g., "2 pm", "2:30pm", "14:15"
-  if (!time) {
-    const m = t.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
-    if (m) {
+  if (m) {
+    if (m[3] || m[2] !== undefined) {
+      // has am/pm OR minutes (colon time)
       let hh = Number(m[1]);
       let mm = Number(m[2] || 0);
-      const ap = m[3] || null;
+      const ap = (m[3] || '').toLowerCase();
       if (ap === 'pm' && hh < 12) hh += 12;
       if (ap === 'am' && hh === 12) hh = 0;
-      if (!ap && hh <= 24) {
-        // 24h style like "14:00"
-        if (hh === 24) hh = 0;
-      }
-      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
-        time = { hh, mm };
-      }
+      if (!ap && hh === 24) hh = 0;
+      if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) time = { hh, mm };
+    } else if (m.index === 0 || /\bat\s*$/.test(t.slice(0, m.index + 1))) {
+      // bare "at 2" without am/pm → accept as 02:00
+      let hh = Number(m[1]);
+      if (hh >= 0 && hh <= 23) time = { hh, mm: 0 };
     }
   }
 
-  // If user said "morning/afternoon" without a time, capture window
+  // window words
   const win = inferPreferredWindowFrom(t);
   if (win) inferredWindow = win;
 
-  if (!date && (time || inferredWindow)) {
-    // If only time/window, assume "today" if still in future; else tomorrow
+  // Only infer a date when intent is clearly about scheduling
+  if (!date && (time || inferredWindow) && hasSchedulingIntent) {
     const maybe = new Date(base.getTime());
     if (time) { maybe.setHours(time.hh, time.mm, 0, 0); }
     else if (inferredWindow === 'morning') { maybe.setHours(9, 0, 0, 0); }
@@ -458,9 +463,9 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   if (!date && !time && !inferredWindow) return null;
 
   const y = date ? date.getFullYear() : base.getFullYear();
-  const m = date ? date.getMonth() + 1 : base.getMonth() + 1;
+  const mth = date ? date.getMonth() + 1 : base.getMonth() + 1;
   const d = date ? date.getDate() : base.getDate();
-  const dateISO = `${y}-${two(m)}-${two(d)}`;
+  const dateISO = `${y}-${two(mth)}-${two(d)}`;
   const timeHHMM = time ? `${two(time.hh)}:${two(time.mm)}` : null;
 
   return { dateISO, timeHHMM, inferredWindow };
@@ -731,6 +736,9 @@ export default async function handler(req, res) {
 
     const history = await fetchHistoryMessages(callSid);
 
+    // Decorate any reply with empathy (when user reports a problem) + branding
+    const E = (r) => enforceHVACBranding(addEmpathy(speech, r));
+
     // Merge slots upfront
     let mergedSlots = { ...(lastSlots || {}) };
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
@@ -739,7 +747,7 @@ export default async function handler(req, res) {
     // --- EMERGENCY FAST-PATH ---
     if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell|smoke)\b/i.test(speech || '')) {
       return res.status(200).json({
-        reply: "If you suspect a safety issue, please hang up and call 911 now. I’ll also alert our dispatcher immediately. Are you safe to continue?",
+        reply: E("If you suspect a safety issue, please hang up and call 911 now. I’ll also alert our dispatcher immediately. Are you safe to continue?"),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -755,7 +763,7 @@ export default async function handler(req, res) {
         mergedSlots.confirmation_pending = false;
         const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing Smith Heating & Air. Goodbye.";
         return res.status(200).json({
-          reply: "",
+          reply: E(""),
           slots: mergedSlots,
           done: true,
           goodbye: bye,
@@ -768,7 +776,7 @@ export default async function handler(req, res) {
       if (isNegation(speech) || /\b(change|update|fix|wrong|not (right|correct))\b/i.test(speech)) {
         mergedSlots.confirmation_pending = false;
         return res.status(200).json({
-          reply: "No problem—what would you like to change?",
+          reply: E("No problem—what would you like to change?"),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -779,7 +787,7 @@ export default async function handler(req, res) {
       }
 
       return res.status(200).json({
-        reply: "If everything is correct, please say “yes.” Otherwise, tell me what to change.",
+        reply: E("If everything is correct, please say “yes.” Otherwise, tell me what to change."),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -796,7 +804,7 @@ export default async function handler(req, res) {
         mergedSlots.address_confirm_pending = false;
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding(prompt),
+          reply: E(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -809,7 +817,7 @@ export default async function handler(req, res) {
         mergedSlots.address_confirm_pending = false;
         mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
         return res.status(200).json({
-          reply: 'Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.',
+          reply: E('Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -819,7 +827,7 @@ export default async function handler(req, res) {
         });
       }
       return res.status(200).json({
-        reply: `Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`,
+        reply: E(`Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -835,7 +843,7 @@ export default async function handler(req, res) {
       if (!n) {
         mergedSlots.callback_confirm_pending = false;
         return res.status(200).json({
-          reply: 'What’s the full 10-digit callback number?',
+          reply: E('What’s the full 10-digit callback number?'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -849,7 +857,7 @@ export default async function handler(req, res) {
         mergedSlots.callback_confirm_pending = false;
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding(prompt),
+          reply: E(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -862,7 +870,7 @@ export default async function handler(req, res) {
         mergedSlots.callback_confirm_pending = false;
         mergedSlots.callback_number = null;
         return res.status(200).json({
-          reply: 'No problem—what’s the full 10-digit callback number?',
+          reply: E('No problem—what’s the full 10-digit callback number?'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -872,7 +880,7 @@ export default async function handler(req, res) {
         });
       }
       return res.status(200).json({
-        reply: `I have ${n} as your callback number. Is that correct? Please say yes or no.`,
+        reply: E(`I have ${n} as your callback number. Is that correct? Please say yes or no.`),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -887,7 +895,7 @@ export default async function handler(req, res) {
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
       return res.status(200).json({
-        reply: enforceHVACBranding(addrProgress.reply),
+        reply: E(addrProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -902,7 +910,7 @@ export default async function handler(req, res) {
     if (phoneProgress.handled) {
       mergedSlots = phoneProgress.slots;
       return res.status(200).json({
-        reply: enforceHVACBranding(phoneProgress.reply),
+        reply: E(phoneProgress.reply),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -926,7 +934,7 @@ export default async function handler(req, res) {
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
-        reply: enforceHVACBranding(prompt),
+        reply: E(prompt),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -942,7 +950,7 @@ export default async function handler(req, res) {
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending) {
       if (isNegation(speech) && isYesNoQuestion(lastQ)) {
         return res.status(200).json({
-          reply: enforceHVACBranding(`No problem—let’s try that again. ${lastQ}`),
+          reply: E(`No problem—let’s try that again. ${lastQ}`),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -958,7 +966,7 @@ export default async function handler(req, res) {
 
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
-          reply: enforceHVACBranding(prompt),
+          reply: E(prompt),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -974,7 +982,7 @@ export default async function handler(req, res) {
       if (!mergedSlots.brand) mergedSlots.brand = 'unknown';
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
-        reply: enforceHVACBranding(prompt),
+        reply: E(prompt),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -1024,7 +1032,7 @@ export default async function handler(req, res) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: enforceHVACBranding('Thanks. Please say the full service address in one sentence, including street, city, state, and zip.'),
+        reply: E('Thanks. Please say the full service address in one sentence, including street, city, state, and zip.'),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -1171,7 +1179,7 @@ export default async function handler(req, res) {
       const goodbyeLine = `${whenLine}${callAheadBit} Thank you for calling Smith Heating & Air. Goodbye.`;
 
       return res.status(200).json({
-        reply: "",
+        reply: E(""),
         slots: mergedSlots,
         done: true,
         goodbye: goodbyeLine,
