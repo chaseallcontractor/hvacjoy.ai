@@ -466,7 +466,7 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   return { dateISO, timeHHMM, inferredWindow };
 }
 
-// ----------------- Detectors & cleaners ------------------
+// ----------------- Detectors & cleaners ----------
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
   if (/\bno problem\b/.test(t)) return false;
@@ -487,9 +487,18 @@ function isNegation(text='') {
   return /\b(no|nope|nah|know|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
 }
 
+// “I don’t know” detector (for brand fast-path)
+function saysDontKnow(text = '') {
+  return /\b(i\s*(do\s*not|don't)\s*know|not sure|no idea|can't tell|unsure|unknown)\b/i.test(text || '');
+}
+
 // Branding & reply guards
 function wantsToContinue(text='') {
-  return /\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(text || '');
+  const t = text || '';
+  if (/\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(t)) return true;
+  // Standalone commands only; avoids matching “next Tuesday”
+  if (/^\s*(continue|next|skip|go ahead)\s*$/i.test(t)) return true;
+  return false;
 }
 function enforceHVACBranding(text='') {
   if (!text) return text;
@@ -958,6 +967,21 @@ export default async function handler(req, res) {
           usage: null,
         });
       }
+    }
+
+    // --- BRAND UNKNOWN FAST-PATH ---
+    if (lastQ && /brand/i.test(lastQ) && (saysDontKnow(speech) || wantsToContinue(speech))) {
+      if (!mergedSlots.brand) mergedSlots.brand = 'unknown';
+      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+      return res.status(200).json({
+        reply: enforceHVACBranding(prompt),
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
     }
 
     // ---- Normal LLM step ---------------------------------------------------

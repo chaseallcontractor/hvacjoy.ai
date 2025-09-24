@@ -165,7 +165,7 @@ function maybeAddEmpathyOnFallback(userText, reply) {
 
 // Common <Gather> attributes (added “no/nope/incorrect” and spoken digits help)
 function gatherAttrs(actionUrl) {
-  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, no, nope, not correct, incorrect, looks good, sounds good, proceed, continue, move on, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
+  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" speechModel="experimental_conversations" hints="yes, yeah, yep, correct, that is correct, that’s correct, no, nope, not correct, incorrect, looks good, sounds good, proceed, continue, move on, next, skip, go ahead, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
 }
 
 // ---------- Handler ----------
