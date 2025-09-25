@@ -8,13 +8,12 @@ const DEFAULT_TZ = process.env.DEFAULT_TZ || 'America/New_York';
 // NEW: default state if caller doesn't say it
 const DEFAULT_STATE = process.env.DEFAULT_STATE || 'GA';
 
-// Pricing from env (defaults match your current values)
+// Pricing from env (kept for future use; not spoken automatically)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
 const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
-const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
 
 // Persona/prompt (neutral, polite tone; no gendered address)
-// *** UPDATED: Problem discovery (thermostat, brand, symptoms) REMOVED per request
+// UPDATED: no proactive pricing; no thermostat/brand/symptom prompts
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
@@ -27,7 +26,7 @@ Voice & Style
 - Briefly acknowledge discomfort or problems, then help.
 
 Safety & Guardrails
-- ${priceLine}
+- Do not proactively quote prices. If the caller asks about pricing, answer briefly and move on.
 - Never promise exact arrival times. Offer a window and a call-ahead.
 - If smoke, sparks, gas smell, or health risk: advise calling 911 and escalate.
 - Do not discuss competitor pricing or quote repair costs beyond policy.
@@ -39,14 +38,13 @@ Call Flow
    - Full name
    - **Full service address** (single question: street, city, and zip). Then reflect it back for yes/no confirmation.
    - Best callback number
-3) Pricing disclosure before scheduling.
-4) Scheduling:
+3) Scheduling:
    - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
    - If the caller provides a **specific time**, accept it instead of a window.
    - If caller is flexible all day, note "flexible_all_day."
-5) Membership check (after booking).
-6) Confirm politely (no long read-back).
-7) Close politely.
+4) Membership check (after booking).
+5) Confirm politely (no long read-back).
+6) Close politely.
 
 Edge Scripts (use when relevant)
 - Ants/pests: “Thanks for sharing that. Please avoid spraying chemicals before the technician arrives.”
@@ -127,7 +125,7 @@ async function fetchHistoryMessages(callSid) {
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
       content: r.text || ''
-    }));
+    })); 
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
     return [];
@@ -157,11 +155,6 @@ function inferPreferredWindowFrom(text) {
   if (/\bevening\b/.test(t)) return 'afternoon';
   if (/\bflexible\b.*\ball day\b|\ball day\b.*\bflexible\b/i.test(t)) return 'flexible_all_day';
   return null;
-}
-function statementMentionsPricing(text) {
-  const t = (text || '').toLowerCase();
-  const fee = String(DIAG_FEE);
-  return /\bdiagnostic\b/.test(t) && new RegExp(`(?:\\$|usd\\s*)?${fee}\\b`).test(t);
 }
 function inferYesNoCallAhead(text) {
   const t = (text || '').toLowerCase();
@@ -465,11 +458,11 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   return { dateISO, timeHHMM, inferredWindow };
 }
 
-// --- Simple validators + normalizers (NEW)
+// --- Simple validators + normalizers
 function isISODate(d) { return typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d); }
 function isHHMM(t)    { return typeof t === 'string' && /^\d{2}:\d{2}$/.test(t); }
 
-// Accepts "2 pm", "2:30pm", "14:15", "noon" -> returns "HH:MM" or null
+// "2 pm" | "2:30pm" | "14:15" | "noon" -> "HH:MM" or null
 function normalizeTimeToHHMM(text, tz = DEFAULT_TZ) {
   if (!text) return null;
   const t = String(text).trim().toLowerCase();
@@ -490,7 +483,6 @@ function normalizeTimeToHHMM(text, tz = DEFAULT_TZ) {
 }
 
 // Force slots.preferred_date to YYYY-MM-DD and preferred_time to HH:MM when possible.
-// Uses parseNaturalDateTime as a fallback when date/time are natural language.
 function normalizeDateTimeInSlots(slots, tz = DEFAULT_TZ) {
   const s = { ...(slots || {}) };
 
@@ -538,7 +530,7 @@ function addEmpathy(speech, reply) {
   return reply;
 }
 
-// quick yes/no helpers (tolerate common ASR “know” → “no”)
+// quick yes/no helpers
 function isAffirmation(text='') {
   return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
 }
@@ -550,7 +542,6 @@ function isNegation(text='') {
 function wantsToContinue(text='') {
   const t = text || '';
   if (/\b(let'?s\s*(continue|keep going|proceed)|already told you|move on)\b/i.test(t)) return true;
-  // Standalone commands only; avoids matching “next Tuesday”
   if (/^\s*(continue|next|skip|go ahead)\s*$/i.test(t)) return true;
   return false;
 }
@@ -580,10 +571,8 @@ function nextMissingPrompt(s) {
   if (!(addr.line1 && addr.city && addr.zip)) {
     return 'Please say the full service address—street, city, and zip.';
   }
-  // (Per request) thermostat/brand/symptoms questions removed.
-  if (s.pricing_disclosed !== true) return `${priceLine} Shall we proceed?`;
+  // Pricing prompt REMOVED per request.
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
-  // If a **specific time** exists, we don't require a window.
   if (!s.preferred_time && !s.preferred_window) {
     return 'What time window works for you—morning, afternoon, or flexible all day?';
   }
@@ -602,19 +591,11 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
   }
   return { newReply: null, updated: false };
 }
-function suppressPricingIfAlreadyDisclosed(reply, mergedSlots) {
-  if (mergedSlots.pricing_disclosed === true &&
-      /diagnostic/i.test(reply) &&
-      new RegExp(`\\$?${DIAG_FEE}\\b`).test(reply)) {
-    return 'Great—thanks for confirming. Let’s get your visit on the calendar.';
-  }
-  return reply;
-}
 
 // Detect yes/no-style questions for fast handling
 function isYesNoQuestion(q = '') {
   const t = (q || '').toLowerCase();
-  return /\b(is (?:that|this) (?:right|correct)|shall we proceed|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
+  return /\b(is (?:that|this) (?:right|correct)|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
 }
 
 // (kept for internal use, not spoken)
@@ -651,7 +632,7 @@ function serverSideDoneCheck(slots) {
     !!s.full_name &&
     !!s.callback_number &&
     !!addr.line1 && !!addr.city && !!addr.zip && // state auto-filled if missing
-    s.pricing_disclosed === true &&
+    // pricing_disclosed no longer required
     dateOK &&
     (timeOK || winOK)
   );
@@ -1009,7 +990,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Natural-language date/time capture (e.g., "tomorrow at 2 pm", "Friday at noon")
+    // ---- Natural-language date/time capture
     const parsedDT = parseNaturalDateTime(speech, DEFAULT_TZ);
     if (parsedDT) {
       if (!mergedSlots.preferred_date) mergedSlots.preferred_date = parsedDT.dateISO;
@@ -1018,7 +999,6 @@ export default async function handler(req, res) {
         mergedSlots.preferred_window = parsedDT.inferredWindow;
       }
     }
-    // NEW: normalize after NL parse as well
     mergedSlots = normalizeDateTimeInSlots(mergedSlots, DEFAULT_TZ);
 
     // ---- Continue / move on → next missing
@@ -1050,10 +1030,8 @@ export default async function handler(req, res) {
           usage: null,
         });
       }
-      // “Yes” to a yes/no question should advance
       if (isAffirmation(speech) && isYesNoQuestion(lastQ)) {
         if (/call[- ]ahead/i.test(lastQ)) mergedSlots.call_ahead = true;
-        if (/shall we proceed|price|diagnostic|\$\s*\d+/i.test(lastQ)) mergedSlots.pricing_disclosed = true;
 
         const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
         return res.status(200).json({
@@ -1073,6 +1051,7 @@ export default async function handler(req, res) {
       'Continue the call. Do not repeat the greeting.' +
       '\nAsk for the FULL service address (street, city, and zip) in one question; if the caller gives only street, ask specifically for the city/zip.' +
       '\nRequire a date for booking. Ask for date first, then time window. If the caller provides a specific time, accept it instead of a window.' +
+      '\nDo not proactively quote prices.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
       '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
       (lastQ ? `\nLast question you asked was:\n"${lastQ}"` : '') +
@@ -1141,7 +1120,7 @@ export default async function handler(req, res) {
     // merge with old slots
     mergedSlots = mergeSlots(mergedSlots, parsed.slots);
 
-    // --- NEW: normalize date/time fields so downstream code gets ISO + HH:MM
+    // normalize date/time fields so downstream code gets ISO + HH:MM
     mergedSlots = normalizeDateTimeInSlots(mergedSlots, DEFAULT_TZ);
 
     // sanitize: never allow confirm gate without a number
@@ -1154,31 +1133,6 @@ export default async function handler(req, res) {
       const win = inferPreferredWindowFrom(speech);
       if (win) mergedSlots.preferred_window = win;
     }
-    if (mergedSlots.pricing_disclosed !== true) {
-      const lastAssistantLines = [...history, { role: 'assistant', content: parsed.reply || '' }]
-        .filter(m => m.role === 'assistant')
-        .slice(-8)
-        .map(m => m.content || '');
-      if (lastAssistantLines.some(statementMentionsPricing)) {
-        mergedSlots.pricing_disclosed = true;
-      }
-    }
-    {
-      const inferred = inferYesNoCallAhead(speech);
-      if (inferred !== null && /call[- ]ahead/i.test(lastQ || '')) {
-        mergedSlots.call_ahead = inferred;
-      }
-    }
-
-    // pricing must precede scheduling
-    const schedHint = /\b(schedule|book|calendar|appointment|appt|date|what (?:date|day)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next (?:mon|tue|wed|thu|fri|sat|sun)|time window|morning|afternoon|flexible|at \d|am|pm|noon|midnight)\b/i;
-    if (mergedSlots.pricing_disclosed !== true && schedHint.test(parsed.reply || '')) {
-      parsed.reply = `${priceLine} Shall we proceed?`;
-    }
-
-    // window repeat guard
-    const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
-    if (guard.updated) parsed.reply = guard.newReply;
 
     // “schedule” but missing required → push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
@@ -1193,8 +1147,7 @@ export default async function handler(req, res) {
       mergedSlots._pleasure_ack = true;
     }
 
-    // Final cleanups (includes empathy)
-    parsed.reply = suppressPricingIfAlreadyDisclosed(parsed.reply, mergedSlots);
+    // Final cleanups
     parsed.reply = suppressMembershipUntilBooked(parsed.reply, mergedSlots);
     parsed.reply = addEmpathy(speech, parsed.reply);
     parsed.reply = stripRepeatedGreeting(history, parsed.reply);
@@ -1222,7 +1175,7 @@ export default async function handler(req, res) {
           s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
         ].filter(Boolean).join('\n');
 
-        // Final defensive normalization
+        // Defensive normalization
         const sNorm = normalizeDateTimeInSlots(s, DEFAULT_TZ);
         const safeDateISO = isISODate(sNorm.preferred_date) ? sNorm.preferred_date : null;
         const safeTimeHHMM = isHHMM(sNorm.preferred_time) ? sNorm.preferred_time : null;
@@ -1244,10 +1197,9 @@ export default async function handler(req, res) {
         });
       } catch (e) {
         console.error('Calendar insert failed:', e?.response?.data || e);
-        // Even if calendar insert fails, we still finish the call cleanly
       }
 
-      // Close cleanly: speak schedule line + call-ahead + contact note + brand closing.
+      // Close cleanly
       const s = mergedSlots || {};
       const sNorm = normalizeDateTimeInSlots(s, DEFAULT_TZ);
       const safeDateISO = isISODate(sNorm.preferred_date) ? sNorm.preferred_date : null;
