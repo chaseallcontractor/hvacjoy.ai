@@ -14,10 +14,10 @@ const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
 const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
 
 // Persona/prompt (neutral, polite tone; no gendered address)
-// NOTE: removed the "How many units" question per request; prompts now ask for street, city, and zip (no example).
+// >>> UPDATED: removed the problem discovery Qs (thermostat, brand, symptoms)
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
-Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
+Primary goal: warmly book service, set expectations, and capture the essentials required to schedule. Do not diagnose.
 
 Voice & Style
 - Friendly, professional, and concise (≤ 14 words).
@@ -39,22 +39,16 @@ Call Flow
    - Full name
    - **Full service address** (single question: street, city, and zip). Then reflect it back for yes/no confirmation.
    - Best callback number
-3) Problem discovery:
-   - Brand (if known)
-   - Symptoms (no cool/heat, airflow, icing, noises, ants/pests)
-   - Thermostat setpoint and current reading
-4) Pricing disclosure before scheduling.
-5) Scheduling:
+3) Pricing disclosure before scheduling.
+4) Scheduling:
    - Offer earliest availability; **ask for a date**, then arrival window + call-ahead.
    - If the caller provides a **specific time**, accept it instead of a window.
    - If caller is flexible all day, note "flexible_all_day."
-6) Membership check (after booking).
-7) Confirm politely (no long read-back).
-8) Close politely.
+5) Membership check (after booking).
+6) Confirm politely (no long read-back).
+7) Close politely.
 
 Edge Scripts (use when relevant)
-- Ants/pests: “Thanks for sharing that. Please avoid spraying chemicals before the technician arrives.”
-- Icing: “Thank you. If you see ice, please turn the system off so it can melt.”
 - Reschedule: “Of course—happy to help. What new time works best?”
 - Irate caller: “I understand this is frustrating. I can secure your details, explain today’s fees, and book the earliest available appointment.”
 
@@ -455,7 +449,7 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
     const maybe = new Date(base.getTime());
     if (time) { maybe.setHours(time.hh, time.mm, 0, 0); }
     else if (inferredWindow === 'morning') { maybe.setHours(9, 0, 0, 0); }
-    else if (inferredWindow === 'afternoon') { maybe.setHours(13, 0, 0, 0); } // FIXED: dot before setHours
+    else if (inferredWindow === 'afternoon') { maybe.setHours(13, 0, 0, 0); }
     date = (maybe > base) ? maybe : new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
   }
 
@@ -491,7 +485,7 @@ function isNegation(text='') {
   return /\b(no|nope|nah|know|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
 }
 
-// “I don’t know” detector (for brand fast-path)
+// “I don’t know” detector (kept but unused for brand flow removal)
 function saysDontKnow(text = '') {
   return /\b(i\s*(do\s*not|don't)\s*know|not sure|no idea|can't tell|unsure|unknown)\b/i.test(text || '');
 }
@@ -530,11 +524,7 @@ function nextMissingPrompt(s) {
   if (!(addr.line1 && addr.city && addr.zip)) {
     return 'Please say the full service address—street, city, and zip.';
   }
-  // REMOVED per request:
-  // if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
-  if (!((s.thermostat||{}).setpoint != null && (s.thermostat||{}).current != null)) {
-    return 'What is the thermostat setpoint, and what does it currently read?';
-  }
+  // >>> REMOVED thermostat/brand/symptoms from required prompts
   if (s.pricing_disclosed !== true) return `${priceLine} Shall we proceed?`;
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
   // If a **specific time** exists, we don't require a window.
@@ -1017,20 +1007,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // --- BRAND UNKNOWN FAST-PATH ---
-    if (lastQ && /brand/i.test(lastQ) && (saysDontKnow(speech) || wantsToContinue(speech))) {
-      if (!mergedSlots.brand) mergedSlots.brand = 'unknown';
-      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
-      return res.status(200).json({
-        reply: E(prompt),
-        slots: mergedSlots,
-        done: false,
-        goodbye: null,
-        needs_confirmation: false,
-        model: 'gpt-4o-mini',
-        usage: null,
-      });
-    }
+    // >>> REMOVED: BRAND UNKNOWN FAST-PATH (no brand questions anymore)
 
     // ---- Normal LLM step ---------------------------------------------------
     const steering =
@@ -1141,11 +1118,7 @@ export default async function handler(req, res) {
     const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
 
-    // thermostat duplicate guard
-    if (/thermostat.*setpoint.*current/i.test(parsed.reply) &&
-        (mergedSlots.thermostat && mergedSlots.thermostat.setpoint != null && mergedSlots.thermostat.current != null)) {
-      parsed.reply = `Great—thanks. ${priceLine} What day works for your visit?`;
-    }
+    // >>> REMOVED: thermostat duplicate guard
 
     // “schedule” but missing required → push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
