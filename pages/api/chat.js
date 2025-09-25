@@ -455,7 +455,7 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
     const maybe = new Date(base.getTime());
     if (time) { maybe.setHours(time.hh, time.mm, 0, 0); }
     else if (inferredWindow === 'morning') { maybe.setHours(9, 0, 0, 0); }
-    else if (inferredWindow === 'afternoon') { maybe setHours(13, 0, 0, 0); }
+    else if (inferredWindow === 'afternoon') { maybe.setHours(13, 0, 0, 0); } // FIXED: dot before setHours
     date = (maybe > base) ? maybe : new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
   }
 
