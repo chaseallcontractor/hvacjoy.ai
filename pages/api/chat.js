@@ -14,10 +14,10 @@ const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
 const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
 
 // Persona/prompt (neutral, polite tone; no gendered address)
-// >>> UPDATED: removed the problem discovery Qs (thermostat, brand, symptoms)
+// *** UPDATED: Problem discovery (thermostat, brand, symptoms) REMOVED per request
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
-Primary goal: warmly book service, set expectations, and capture the essentials required to schedule. Do not diagnose.
+Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
 
 Voice & Style
 - Friendly, professional, and concise (≤ 14 words).
@@ -49,6 +49,7 @@ Call Flow
 7) Close politely.
 
 Edge Scripts (use when relevant)
+- Ants/pests: “Thanks for sharing that. Please avoid spraying chemicals before the technician arrives.”
 - Reschedule: “Of course—happy to help. What new time works best?”
 - Irate caller: “I understand this is frustrating. I can secure your details, explain today’s fees, and book the earliest available appointment.”
 
@@ -126,7 +127,7 @@ async function fetchHistoryMessages(callSid) {
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
       content: r.text || ''
-    })); 
+    }));
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
     return [];
@@ -389,7 +390,7 @@ function nextWeekdayDate(base, targetName) {
 }
 function two(n){ return String(n).padStart(2,'0'); }
 
-// >>> Hardened parser to avoid "2 units" => 02:00 and require scheduling intent
+// Hardened parser; requires scheduling intent for time-only phrases.
 function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   const t = (text || '').toLowerCase();
 
@@ -464,6 +465,66 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   return { dateISO, timeHHMM, inferredWindow };
 }
 
+// --- Simple validators + normalizers (NEW)
+function isISODate(d) { return typeof d === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(d); }
+function isHHMM(t)    { return typeof t === 'string' && /^\d{2}:\d{2}$/.test(t); }
+
+// Accepts "2 pm", "2:30pm", "14:15", "noon" -> returns "HH:MM" or null
+function normalizeTimeToHHMM(text, tz = DEFAULT_TZ) {
+  if (!text) return null;
+  const t = String(text).trim().toLowerCase();
+  if (t === 'noon') return '12:00';
+  if (t === 'midnight') return '00:00';
+  let m = t.match(/^(\d{1,2})(?::(\d{2}))?\s*(am|pm)?$/i);
+  if (!m) return null;
+  let hh = Number(m[1]);
+  let mm = Number(m[2] || 0);
+  const ap = (m[3] || '').toLowerCase();
+  if (ap === 'pm' && hh < 12) hh += 12;
+  if (ap === 'am' && hh === 12) hh = 0;
+  if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) {
+    const two2 = (n)=>String(n).padStart(2,'0');
+    return `${two2(hh)}:${two2(mm)}`;
+  }
+  return null;
+}
+
+// Force slots.preferred_date to YYYY-MM-DD and preferred_time to HH:MM when possible.
+// Uses parseNaturalDateTime as a fallback when date/time are natural language.
+function normalizeDateTimeInSlots(slots, tz = DEFAULT_TZ) {
+  const s = { ...(slots || {}) };
+
+  // Preferred date
+  if (!isISODate(s.preferred_date) && typeof s.preferred_date === 'string') {
+    const parsed = parseNaturalDateTime(s.preferred_date, tz);
+    if (parsed?.dateISO) s.preferred_date = parsed.dateISO;
+  }
+  if (!isISODate(s.preferred_date)) {
+    const joined = [s.preferred_date, s.preferred_window, s.preferred_time].filter(Boolean).join(' ');
+    const parsed = parseNaturalDateTime(joined || '', tz);
+    if (parsed?.dateISO) s.preferred_date = parsed.dateISO;
+  }
+
+  // Preferred time
+  if (s.preferred_time && !isHHMM(s.preferred_time)) {
+    const fixed = normalizeTimeToHHMM(s.preferred_time, tz);
+    if (fixed) s.preferred_time = fixed;
+    else s.preferred_time = null; // fall back to window
+  }
+
+  // Preferred window – keep only known values
+  const okWin = new Set(['morning','afternoon','flexible_all_day']);
+  if (s.preferred_window && !okWin.has(String(s.preferred_window).toLowerCase())) {
+    const w = String(s.preferred_window).toLowerCase();
+    if (/morning/.test(w)) s.preferred_window = 'morning';
+    else if (/afternoon|evening/.test(w)) s.preferred_window = 'afternoon';
+    else if (/flexible.*all.*day|all.*day.*flexible/.test(w)) s.preferred_window = 'flexible_all_day';
+    else s.preferred_window = null;
+  }
+
+  return s;
+}
+
 // ----------------- Detectors & cleaners ----------
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
@@ -483,11 +544,6 @@ function isAffirmation(text='') {
 }
 function isNegation(text='') {
   return /\b(no|nope|nah|know|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
-}
-
-// “I don’t know” detector (kept but unused for brand flow removal)
-function saysDontKnow(text = '') {
-  return /\b(i\s*(do\s*not|don't)\s*know|not sure|no idea|can't tell|unsure|unknown)\b/i.test(text || '');
 }
 
 // Branding & reply guards
@@ -524,7 +580,7 @@ function nextMissingPrompt(s) {
   if (!(addr.line1 && addr.city && addr.zip)) {
     return 'Please say the full service address—street, city, and zip.';
   }
-  // >>> REMOVED thermostat/brand/symptoms from required prompts
+  // (Per request) thermostat/brand/symptoms questions removed.
   if (s.pricing_disclosed !== true) return `${priceLine} Shall we proceed?`;
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
   // If a **specific time** exists, we don't require a window.
@@ -588,13 +644,16 @@ function summaryFromSlots(s) {
 function serverSideDoneCheck(slots) {
   const s = slots || {};
   const addr = s.service_address || {};
+  const dateOK = isISODate(s.preferred_date);
+  const timeOK = !!s.preferred_time && isHHMM(s.preferred_time);
+  const winOK  = !!s.preferred_window;
   return (
     !!s.full_name &&
     !!s.callback_number &&
-    !!addr.line1 && !!addr.city && !!addr.zip && // state no longer required from caller
+    !!addr.line1 && !!addr.city && !!addr.zip && // state auto-filled if missing
     s.pricing_disclosed === true &&
-    !!s.preferred_date &&
-    (!!s.preferred_window || !!s.preferred_time)
+    dateOK &&
+    (timeOK || winOK)
   );
 }
 
@@ -959,6 +1018,8 @@ export default async function handler(req, res) {
         mergedSlots.preferred_window = parsedDT.inferredWindow;
       }
     }
+    // NEW: normalize after NL parse as well
+    mergedSlots = normalizeDateTimeInSlots(mergedSlots, DEFAULT_TZ);
 
     // ---- Continue / move on → next missing
     if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
@@ -1006,8 +1067,6 @@ export default async function handler(req, res) {
         });
       }
     }
-
-    // >>> REMOVED: BRAND UNKNOWN FAST-PATH (no brand questions anymore)
 
     // ---- Normal LLM step ---------------------------------------------------
     const steering =
@@ -1082,6 +1141,9 @@ export default async function handler(req, res) {
     // merge with old slots
     mergedSlots = mergeSlots(mergedSlots, parsed.slots);
 
+    // --- NEW: normalize date/time fields so downstream code gets ISO + HH:MM
+    mergedSlots = normalizeDateTimeInSlots(mergedSlots, DEFAULT_TZ);
+
     // sanitize: never allow confirm gate without a number
     if (mergedSlots.callback_confirm_pending && !mergedSlots.callback_number) {
       mergedSlots.callback_confirm_pending = false;
@@ -1108,7 +1170,7 @@ export default async function handler(req, res) {
       }
     }
 
-    // pricing must precede scheduling (broader detection)
+    // pricing must precede scheduling
     const schedHint = /\b(schedule|book|calendar|appointment|appt|date|what (?:date|day)|monday|tuesday|wednesday|thursday|friday|saturday|sunday|next (?:mon|tue|wed|thu|fri|sat|sun)|time window|morning|afternoon|flexible|at \d|am|pm|noon|midnight)\b/i;
     if (mergedSlots.pricing_disclosed !== true && schedHint.test(parsed.reply || '')) {
       parsed.reply = `${priceLine} Shall we proceed?`;
@@ -1117,8 +1179,6 @@ export default async function handler(req, res) {
     // window repeat guard
     const guard = sameQuestionRepeatGuard(lastQ, parsed.reply, speech, mergedSlots);
     if (guard.updated) parsed.reply = guard.newReply;
-
-    // >>> REMOVED: thermostat duplicate guard
 
     // “schedule” but missing required → push next missing prompt
     if (/schedule|book|calendar/i.test(parsed.reply) && !serverSideDoneCheck(mergedSlots)) {
@@ -1150,6 +1210,7 @@ export default async function handler(req, res) {
         const addr = s.service_address || {};
         const title = `HVAC Joy – ${s.full_name || 'Service Call'}`;
         const location = [addr.line1, addr.city, (addr.state || DEFAULT_STATE), addr.zip].filter(Boolean).join(', ');
+
         const description = [
           `Callback: ${s.callback_number || 'N/A'}`,
           s.unit_count != null ? `Units: ${s.unit_count}` : null,
@@ -1161,11 +1222,16 @@ export default async function handler(req, res) {
           s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
         ].filter(Boolean).join('\n');
 
+        // Final defensive normalization
+        const sNorm = normalizeDateTimeInSlots(s, DEFAULT_TZ);
+        const safeDateISO = isISODate(sNorm.preferred_date) ? sNorm.preferred_date : null;
+        const safeTimeHHMM = isHHMM(sNorm.preferred_time) ? sNorm.preferred_time : null;
+
         let startEnd;
-        if (s.preferred_time) {
-          startEnd = timeToTimes(s.preferred_date, s.preferred_time, DEFAULT_TZ);
+        if (safeTimeHHMM) {
+          startEnd = timeToTimes(safeDateISO, safeTimeHHMM, DEFAULT_TZ);
         } else {
-          startEnd = windowToTimes(s.preferred_date, s.preferred_window, DEFAULT_TZ);
+          startEnd = windowToTimes(safeDateISO, sNorm.preferred_window, DEFAULT_TZ);
         }
 
         await insertCalendarEvent(process.env.GOOGLE_CALENDAR_ID, {
@@ -1178,15 +1244,19 @@ export default async function handler(req, res) {
         });
       } catch (e) {
         console.error('Calendar insert failed:', e?.response?.data || e);
-        // even if calendar insert fails, we still finish the call cleanly
+        // Even if calendar insert fails, we still finish the call cleanly
       }
 
       // Close cleanly: speak schedule line + call-ahead + contact note + brand closing.
       const s = mergedSlots || {};
-      const pretty = formatPretty(s.preferred_date, s.preferred_time || null, DEFAULT_TZ);
-      const windowNote = (!s.preferred_time && s.preferred_window) ? ` in the ${s.preferred_window} window` : '';
+      const sNorm = normalizeDateTimeInSlots(s, DEFAULT_TZ);
+      const safeDateISO = isISODate(sNorm.preferred_date) ? sNorm.preferred_date : null;
+      const safeTimeHHMM = isHHMM(sNorm.preferred_time) ? sNorm.preferred_time : null;
+
+      const pretty = safeDateISO ? formatPretty(safeDateISO, safeTimeHHMM || null, DEFAULT_TZ) : null;
+      const windowNote = (!safeTimeHHMM && sNorm.preferred_window) ? ` in the ${sNorm.preferred_window} window` : '';
       const whenLine = pretty ? `You’re scheduled for ${pretty}${windowNote}.` : 'Your appointment is scheduled.';
-      const callAheadBit = (s.call_ahead === false)
+      const callAheadBit = (sNorm.call_ahead === false)
         ? ' We will arrive within your window without a call-ahead.'
         : ' We’ll call ahead before arriving.';
       const goodbyeLine = `${whenLine}${callAheadBit} A member of our team will contact you to confirm the appointment. Thank you for calling Smith Heating & Air. Good Bye.`;
