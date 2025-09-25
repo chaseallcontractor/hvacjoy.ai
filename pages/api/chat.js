@@ -5,6 +5,8 @@ import { insertCalendarEvent } from '../../lib/google-calendar.js';
 
 // --- Timezone (Georgia/Eastern by default) ---
 const DEFAULT_TZ = process.env.DEFAULT_TZ || 'America/New_York';
+// NEW: default state if caller doesn't say it
+const DEFAULT_STATE = process.env.DEFAULT_STATE || 'GA';
 
 // Pricing from env (defaults match your current values)
 const DIAG_FEE  = process.env.DIAG_FEE  ? Number(process.env.DIAG_FEE)  : 89;
@@ -12,6 +14,7 @@ const MAINT_FEE = process.env.MAINT_FEE ? Number(process.env.MAINT_FEE) : 179;
 const priceLine = `Our diagnostic visit is $${DIAG_FEE} per non-working unit. A maintenance visit is $${MAINT_FEE} for non-members.`;
 
 // Persona/prompt (neutral, polite tone; no gendered address)
+// NOTE: removed the "How many units" question per request; prompts now ask for street, city, and zip (no example).
 const SYSTEM_PROMPT = `
 You are “Joy,” the inbound phone agent for a residential H.V.A.C company.
 Primary goal: warmly book service, set expectations, and capture complete job details. Do not diagnose.
@@ -34,10 +37,9 @@ Call Flow
 1) Greeting (only once per call).
 2) Capture + confirm:
    - Full name
-   - **Full service address** (single question: street, city, state, zip). Then reflect it back for yes/no confirmation.
+   - **Full service address** (single question: street, city, and zip). Then reflect it back for yes/no confirmation.
    - Best callback number
 3) Problem discovery:
-   - Unit count and locations
    - Brand (if known)
    - Symptoms (no cool/heat, airflow, icing, noises, ants/pests)
    - Thermostat setpoint and current reading
@@ -104,7 +106,7 @@ slots schema:
 Behavior
 - Continue the call. Do not repeat the greeting (“Welcome to H.V.A.C Joy…”).
 - Do NOT ask again for any slot already non-null in "known slots".
-- Ask for the **full address** in one question; if the caller gives only street (no city/state/zip), ask specifically for the missing parts — do not claim the address is “updated.”
+- Ask for the **full address** in one question; if the caller gives only street (no city/zip), ask specifically for the missing parts — do not claim the address is “updated.”
 - Require a date for booking. Ask for date first, then window **unless a specific time was provided**.
 - If the caller corrects a prior detail, acknowledge, update, and confirm the new value.
 - When done is reached, do NOT read any summary and do NOT ask “Is everything correct?” — simply close politely.
@@ -258,15 +260,14 @@ function parseFullAddress(line) {
   let re = new RegExp(
     `\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?${STREET_SUFFIX})\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
-    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))?\\b\\s*` + // state now optional
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
   let m = txt.match(re);
   if (m) {
     const stateToken = m[3] || m[4];
-    const state = normState(stateToken);
-    if (!state) return null;
+    const state = normState(stateToken) || null;
     return {
       line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
       city: m[2].trim(),
@@ -279,15 +280,14 @@ function parseFullAddress(line) {
   re = new RegExp(
     `\\b(\\d{1,8}\\s+[A-Za-z0-9.\\s,]+?)\\b[, ]+\\s*` +
     `([A-Za-z][A-Za-z\\s]+?)\\s*,?\\s*` +
-    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\b\\s+` +
+    `(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))?\\b\\s*` +
     `(\\d{5})(?:-\\d{4})?\\b`,
     'i'
   );
   m = txt.match(re);
   if (m) {
     const stateToken = m[3] || m[4];
-    const state = normState(stateToken);
-    if (!state) return null;
+    const state = normState(stateToken) || null;
     return {
       line1: m[1].replace(/,\s*/g, ' ').replace(/\s{2,}/g, ' ').trim(),
       city: m[2].trim(),
@@ -312,15 +312,14 @@ function parseCityStateZip(text = '') {
   const txt = cleanAddressText(text);
   const m = (txt || '').match(
     new RegExp(
-      `\\b([A-Za-z][A-Za-z\\s]+?),?\\s*(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))\\s+(\\d{5})(?:-\\d{4})?\\b`,
+      `\\b([A-Za-z][A-Za-z\\s]+?),?\\s*(?:(${STATE_NAME_RE.source})|([A-Za-z]{2}))?\\s+(\\d{5})(?:-\\d{4})?\\b`,
       'i'
     )
   );
   if (!m) return null;
   const city = m[1].trim();
   const stateToken = m[2] || m[3];
-  const state = normState(stateToken);
-  if (!state) return null;
+  const state = normState(stateToken) || null;
   const zip = m[4];
   return { city, state, zip };
 }
@@ -456,7 +455,7 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
     const maybe = new Date(base.getTime());
     if (time) { maybe.setHours(time.hh, time.mm, 0, 0); }
     else if (inferredWindow === 'morning') { maybe.setHours(9, 0, 0, 0); }
-    else if (inferredWindow === 'afternoon') { maybe.setHours(13, 0, 0, 0); }
+    else if (inferredWindow === 'afternoon') { maybe setHours(13, 0, 0, 0); }
     date = (maybe > base) ? maybe : new Date(base.getFullYear(), base.getMonth(), base.getDate() + 1);
   }
 
@@ -528,10 +527,11 @@ function nextMissingPrompt(s) {
   const addr = s.service_address || {};
   if (!s.full_name) return 'Can I have your full name, please?';
   if (!s.callback_number) return 'Thank you. What’s the full 10-digit callback number?';
-  if (!(addr.line1 && addr.city && addr.state && addr.zip)) {
-    return 'Please say the full service address in one sentence, including street, city, state, and zip.';
+  if (!(addr.line1 && addr.city && addr.zip)) {
+    return 'Please say the full service address—street, city, and zip.';
   }
-  if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
+  // REMOVED per request:
+  // if (s.unit_count == null) return 'How many AC units do you have, and where are they located?';
   if (!((s.thermostat||{}).setpoint != null && (s.thermostat||{}).current != null)) {
     return 'What is the thermostat setpoint, and what does it currently read?';
   }
@@ -575,7 +575,7 @@ function isYesNoQuestion(q = '') {
 function summaryFromSlots(s) {
   const name = s.full_name || 'Unknown';
   const addr = s.service_address || {};
-  const addrLine = [addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ');
+  const addrLine = [addr.line1, addr.city, addr.state || DEFAULT_STATE, addr.zip].filter(Boolean).join(', ');
   const units = s.unit_count != null ? `${s.unit_count}` : 'Unknown';
   const locs = s.unit_locations ? `, ${s.unit_locations}` : '';
   const brand = s.brand ? s.brand : 'Unknown';
@@ -601,7 +601,7 @@ function serverSideDoneCheck(slots) {
   return (
     !!s.full_name &&
     !!s.callback_number &&
-    !!addr.line1 && !!addr.city && !!addr.state && !!addr.zip &&
+    !!addr.line1 && !!addr.city && !!addr.zip && // state no longer required from caller
     s.pricing_disclosed === true &&
     !!s.preferred_date &&
     (!!s.preferred_window || !!s.preferred_time)
@@ -640,8 +640,7 @@ function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
 
   const [y, m, d] = dateISO.split('-').map(Number);
 
-  // Anchor at noon UTC so the *date* renders correctly in the target TZ,
-  // without interpreting the provided time as UTC (which causes a shift).
+  // Anchor at noon UTC so the *date* renders correctly in the target TZ
   const anchor = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
 
   const weekday  = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(anchor);
@@ -658,32 +657,64 @@ function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
   return timePart ? `${weekday}, ${monthDay} at ${timePart}` : `${weekday}, ${monthDay}`;
 }
 
-// ---- Address progress: accept ONLY a complete, one-line address
+// ---- Address progress: accept street + city + zip; auto-fill state
 function handleAddressProgress_STRICT(speech, slots) {
   const s = { ...(slots || {}) };
+  const addr = s.service_address || {};
 
-  const haveAll =
-    s.service_address &&
-    s.service_address.line1 &&
-    s.service_address.city &&
-    s.service_address.state &&
-    s.service_address.zip;
-  if (haveAll) return { slots: s, reply: null, handled: false };
+  // Consider address "good enough" with line1 + city + zip; state will be auto-filled
+  const haveEnough = addr.line1 && addr.city && addr.zip;
+  if (haveEnough) {
+    if (!addr.state) {
+      s.service_address = { ...addr, state: DEFAULT_STATE };
+    }
+    return { slots: s, reply: null, handled: false };
+  }
 
+  // Try to parse a full address (street, city, [state], zip)
   const full = parseFullAddress(speech);
   if (full) {
+    if (!full.state) full.state = DEFAULT_STATE;
     s.service_address = { ...(s.service_address || {}), ...full };
     s.address_confirm_pending = true;
+    const a = s.service_address;
     return {
       slots: s,
-      reply: `Thank you. I have ${full.line1}, ${full.city}, ${full.state} ${full.zip}. Is that correct?`,
+      reply: `Thank you. I have ${a.line1}, ${a.city}, ${a.state} ${a.zip}. Is that correct?`,
       handled: true
     };
   }
 
+  // Minimal parse: street + city + zip (state missing)
+  const line1 = parseAddressLine1(speech);
+  const csz = parseCityStateZip(speech);
+  const cityZip = (() => {
+    if (csz && csz.city && csz.zip) return { city: csz.city, zip: csz.zip, state: csz.state || null };
+    const m = (speech || '').match(/\b([A-Za-z][A-Za-z\s]+?)\s+(\d{5})(?:-\d{4})?\b/);
+    return m ? { city: m[1].trim(), zip: m[2], state: null } : null;
+  })();
+
+  if (line1 && cityZip) {
+    s.service_address = {
+      ...(s.service_address || {}),
+      line1,
+      city: cityZip.city,
+      zip: cityZip.zip,
+      state: cityZip.state || DEFAULT_STATE
+    };
+    s.address_confirm_pending = true;
+    const a = s.service_address;
+    return {
+      slots: s,
+      reply: `Thank you. I have ${a.line1}, ${a.city}, ${a.state} ${a.zip}. Is that correct?`,
+      handled: true
+    };
+  }
+
+  // Ask again, with simplified wording (no example)
   return {
     slots: s,
-    reply: 'Please say the full service address in one sentence, including street, city, state, and zip. For example: 123 Main Street, Washington, DC 10001.',
+    reply: 'Please say the full service address—street, city, and zip.',
     handled: true
   };
 }
@@ -770,7 +801,7 @@ export default async function handler(req, res) {
     if (mergedSlots.confirmation_pending === true) {
       if (isAffirmation(speech) && !isNegation(speech)) {
         mergedSlots.confirmation_pending = false;
-        const bye = "You’re set. We’ll call ahead before arriving. Thank you for choosing Smith Heating & Air. Goodbye.";
+        const bye = "You’re set. We’ll call ahead before arriving. A member of our team will contact you to confirm the appointment. Thank you for calling Smith Heating & Air. Good Bye.";
         return res.status(200).json({
           reply: E(""),
           slots: mergedSlots,
@@ -826,7 +857,7 @@ export default async function handler(req, res) {
         mergedSlots.address_confirm_pending = false;
         mergedSlots.service_address = { line1: null, line2: null, city: null, state: null, zip: null };
         return res.status(200).json({
-          reply: E('Sorry about that—what is the correct full address? Please say it in one sentence, including street, city, state, and zip.'),
+          reply: E('Sorry about that—what is the correct full address? Please say it in one sentence: street, city, and zip.'),
           slots: mergedSlots,
           done: false,
           goodbye: null,
@@ -836,7 +867,7 @@ export default async function handler(req, res) {
         });
       }
       return res.status(200).json({
-        reply: E(`Is this address correct: ${[addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`),
+        reply: E(`Is this address correct: ${[addr.line1, addr.city, (addr.state || DEFAULT_STATE), addr.zip].filter(Boolean).join(', ')}? Please say yes or no.`),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -899,7 +930,7 @@ export default async function handler(req, res) {
       });
     }
 
-    // ---- Strict address capture (one-line only)
+    // ---- Strict address capture (street+city+zip accepted; state auto-fill)
     const addrProgress = handleAddressProgress_STRICT(speech, mergedSlots);
     if (addrProgress.handled) {
       mergedSlots = addrProgress.slots;
@@ -1004,7 +1035,7 @@ export default async function handler(req, res) {
     // ---- Normal LLM step ---------------------------------------------------
     const steering =
       'Continue the call. Do not repeat the greeting.' +
-      '\nAsk for the FULL service address (street, city, state, zip) in one question; if the caller gives only street, ask specifically for the city/state/zip.' +
+      '\nAsk for the FULL service address (street, city, and zip) in one question; if the caller gives only street, ask specifically for the city/zip.' +
       '\nRequire a date for booking. Ask for date first, then time window. If the caller provides a specific time, accept it instead of a window.' +
       '\nIf the caller’s reply does NOT answer your last question, politely re-ask the same question and continue.' +
       '\nIf the caller says we already discussed something, skip repeating it and continue forward.' +
@@ -1041,7 +1072,7 @@ export default async function handler(req, res) {
       const text = await resp?.text();
       console.error('OpenAI error', text);
       return res.status(200).json({
-        reply: E('Thanks. Please say the full service address in one sentence, including street, city, state, and zip.'),
+        reply: E('Thanks. Please say the full service address—street, city, and zip.'),
         slots: mergedSlots,
         done: false,
         goodbye: null,
@@ -1058,7 +1089,7 @@ export default async function handler(req, res) {
     try { parsed = JSON.parse(raw); }
     catch {
       parsed = {
-        reply: 'Thanks. What’s the next detail—your full service address with city, state, and zip?',
+        reply: 'Thanks. What’s the next detail—your full service address: street, city, and zip?',
         slots: {},
         done: false,
         goodbye: null,
@@ -1067,7 +1098,7 @@ export default async function handler(req, res) {
     }
 
     if (typeof parsed.reply !== 'string') {
-      parsed.reply = 'Thanks. What’s the next detail—your full service address with city, state, and zip?';
+      parsed.reply = 'Thanks. What’s the next detail—your full service address: street, city, and zip?';
     }
     if (!parsed.slots || typeof parsed.slots !== 'object') parsed.slots = {};
 
@@ -1145,7 +1176,7 @@ export default async function handler(req, res) {
         const s = mergedSlots || {};
         const addr = s.service_address || {};
         const title = `HVAC Joy – ${s.full_name || 'Service Call'}`;
-        const location = [addr.line1, addr.city, addr.state, addr.zip].filter(Boolean).join(', ');
+        const location = [addr.line1, addr.city, (addr.state || DEFAULT_STATE), addr.zip].filter(Boolean).join(', ');
         const description = [
           `Callback: ${s.callback_number || 'N/A'}`,
           s.unit_count != null ? `Units: ${s.unit_count}` : null,
@@ -1177,7 +1208,7 @@ export default async function handler(req, res) {
         // even if calendar insert fails, we still finish the call cleanly
       }
 
-      // Close cleanly: speak schedule line + call-ahead, then brand closing.
+      // Close cleanly: speak schedule line + call-ahead + contact note + brand closing.
       const s = mergedSlots || {};
       const pretty = formatPretty(s.preferred_date, s.preferred_time || null, DEFAULT_TZ);
       const windowNote = (!s.preferred_time && s.preferred_window) ? ` in the ${s.preferred_window} window` : '';
@@ -1185,7 +1216,7 @@ export default async function handler(req, res) {
       const callAheadBit = (s.call_ahead === false)
         ? ' We will arrive within your window without a call-ahead.'
         : ' We’ll call ahead before arriving.';
-      const goodbyeLine = `${whenLine}${callAheadBit} Thank you for calling Smith Heating & Air. Goodbye.`;
+      const goodbyeLine = `${whenLine}${callAheadBit} A member of our team will contact you to confirm the appointment. Thank you for calling Smith Heating & Air. Good Bye.`;
 
       return res.status(200).json({
         reply: E(""),
@@ -1210,7 +1241,7 @@ export default async function handler(req, res) {
   } catch (err) {
     console.error('chat handler error', err);
     return res.status(200).json({
-      reply: enforceHVACBranding("I caught that. When you’re ready, please say the full service address in one sentence, including street, city, state, and zip."),
+      reply: enforceHVACBranding("I caught that. When you’re ready, please say the full service address—street, city, and zip."),
       slots: (req.body && req.body.lastSlots) || {},
       done: false,
       goodbye: null,

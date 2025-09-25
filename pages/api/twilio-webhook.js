@@ -41,8 +41,7 @@ function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
 
   const [y, m, d] = dateISO.split('-').map(Number);
 
-  // Anchor at noon UTC so the *date* renders correctly in the target TZ,
-  // without interpreting the provided time as UTC (which causes a shift).
+  // Anchor at noon UTC so the *date* renders correctly in the target TZ
   const anchor = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
 
   const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(anchor);
@@ -145,7 +144,9 @@ function makeGoodbyeFromSlots(slots = {}) {
   const callAheadBit = (slots.call_ahead === false)
     ? ' We will arrive within your window without a call-ahead.'
     : ' We will call ahead before arriving.';
-  return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit} Goodbye.`;
+  // Updated closing per request
+  const confirmNote = ' A member of our team will contact you to confirm the appointment.';
+  return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit}${confirmNote} Thank you for calling Smith Heating & Air. Good Bye.`;
 }
 
 function normalizeCallAheadInText(text = '', slots = {}) {
@@ -208,26 +209,20 @@ export default async function handler(req, res) {
     if (!introPlayed) {
       const introDisplay =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
-      const example =
-        'Please say the full address in one sentence, for example: 123 Main Street, Washington, DC 10001.';
 
       await logTurn({ supabase, caller: from, callSid, text: introDisplay, role: 'assistant', meta: { type: 'intro' } });
 
       const welcome = 'Welcome to Smith Heating & Air. I am your digital assistant Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
-      const exampleUrl = ttsUrlAbsolute(baseUrl, example, SELECTED_VOICE);
       const didntCatchUrl = ttsUrlAbsolute(
         baseUrl,
-        'Sorry, I didn’t catch that. Please say the full address in one sentence, including street, city, state, and zip.',
+        'Sorry, I didn’t catch that. Please say the full service address—street, city, and zip.',
         SELECTED_VOICE
       );
 
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${welcomeUrl}</Play>
-  <Pause length="1"/>
-  <Gather ${gatherAttrs(actionUrl)}/>
-  <Play>${exampleUrl}</Play>
   <Pause length="1"/>
   <Gather ${gatherAttrs(actionUrl)}/>
   <Play>${didntCatchUrl}</Play>
