@@ -125,7 +125,7 @@ async function fetchHistoryMessages(callSid) {
     return (data || []).map(r => ({
       role: r.role === 'assistant' ? 'assistant' : 'user',
       content: r.text || ''
-    })); 
+    }));
   } catch (e) {
     console.error('fetchHistoryMessages error', e);
     return [];
@@ -173,7 +173,7 @@ function getLastAssistantQuestion(history) {
 
 // ----------------- Address parsing support ------------------
 
-// Normalize “one two three four …” (and “oh/o”=0) at the **start** of the line.
+// Normalize “one two three …” (and “oh/o”=0) at the **start** of the line.
 function normalizeLeadingNumberWords(s = '') {
   if (!s) return s;
   const map = {
@@ -181,16 +181,14 @@ function normalizeLeadingNumberWords(s = '') {
     one: '1', two: '2', three: '3', four: '4', five: '5',
     six: '6', seven: '7', eight: '8', nine: '9'
   };
-  // strip filler words the ASR sometimes inserts
   let text = s.replace(/\b(comma|period|dot|dash|hyphen)\b/gi, ' ');
-  // scan tokens from the start until a non-number token
   const tokens = text.split(/[\s,.-]+/);
   let i = 0, digits = '';
   while (i < tokens.length) {
     const t = (tokens[i] || '').toLowerCase();
     if (t in map) { digits += map[t]; i++; continue; }
     if (/^\d+$/.test(t)) { digits += t; i++; continue; }
-    if (t === 'and') { i++; continue; } // ignore “and”
+    if (t === 'and') { i++; continue; }
     break;
   }
   if (digits.length >= 1) {
@@ -368,7 +366,6 @@ function nowInTZ(tz = DEFAULT_TZ) {
     hour: '2-digit', minute: '2-digit', hour12: false
   }).formatToParts(new Date());
   const get = (t) => Number(fmt.find(p => p.type === t)?.value || 0);
-  // Months are 1-based in parts
   return new Date(get('year'), get('month') - 1, get('day'), get('hour'), get('minute'));
 }
 const WEEKDAYS = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
@@ -382,6 +379,15 @@ function nextWeekdayDate(base, targetName) {
   return d;
 }
 function two(n){ return String(n).padStart(2,'0'); }
+
+// --- NEW: make an ISO day string in the *target* TZ
+function dateISOInTZ(d, tz = DEFAULT_TZ) {
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz, year: 'numeric', month: '2-digit', day: '2-digit'
+  }).formatToParts(d);
+  const v = t => parts.find(p => p.type === t)?.value;
+  return `${v('year')}-${v('month')}-${v('day')}`;
+}
 
 // Hardened parser; requires scheduling intent for time-only phrases.
 function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
@@ -412,14 +418,12 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
   }
 
   // time phrases with clear signals ONLY
-  // Accept: "at 2", "at 2 pm", "at 2:30pm", "2:30", "14:15", "2 pm", "11am"
   let m = t.match(/\bat\s*(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/);
   if (!m) m = t.match(/\b(\d{1,2}):(\d{2})\b/);
   if (!m) m = t.match(/\b(\d{1,2})\s*(am|pm)\b/);
 
   if (m) {
     if (m[3] || m[2] !== undefined) {
-      // has am/pm OR minutes (colon time)
       let hh = Number(m[1]);
       let mm = Number(m[2] || 0);
       const ap = (m[3] || '').toLowerCase();
@@ -428,7 +432,6 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
       if (!ap && hh === 24) hh = 0;
       if (hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59) time = { hh, mm };
     } else if (m.index === 0 || /\bat\s*$/.test(t.slice(0, m.index + 1))) {
-      // bare "at 2" without am/pm → accept as 02:00
       let hh = Number(m[1]);
       if (hh >= 0 && hh <= 23) time = { hh, mm: 0 };
     }
@@ -449,10 +452,8 @@ function parseNaturalDateTime(text, tz = DEFAULT_TZ) {
 
   if (!date && !time && !inferredWindow) return null;
 
-  const y = date ? date.getFullYear() : base.getFullYear();
-  const mth = date ? date.getMonth() + 1 : base.getMonth() + 1;
-  const d = date ? date.getDate() : base.getDate();
-  const dateISO = `${y}-${two(mth)}-${two(d)}`;
+  // *** Key fix: compute ISO date in target TZ, not server local
+  const dateISO = dateISOInTZ(date || base, tz);
   const timeHHMM = time ? `${two(time.hh)}:${two(time.mm)}` : null;
 
   return { dateISO, timeHHMM, inferredWindow };
@@ -532,7 +533,8 @@ function addEmpathy(speech, reply) {
 
 // quick yes/no helpers
 function isAffirmation(text='') {
-  return /\b(yes|yep|yeah|correct|that'?s (right|correct)|looks good|sounds good|ok|okay|proceed|continue|let'?s continue|go ahead|move on|that works)\b/i.test(text);
+  const norm = (text || '').toLowerCase().trim().replace(/[!.?,;:]+$/g,'').replace(/\s+/g,' ');
+  return /\b(yes|yep|yeah|yah|yup|sure|ok|okay|correct|that'?s (right|correct)|looks good|sounds good|please continue|go ahead|proceed|continue|that works)\b/i.test(norm);
 }
 function isNegation(text='') {
   return /\b(no|nope|nah|know|not (right|correct)|change|fix|update|wrong)\b/i.test(text);
@@ -571,7 +573,6 @@ function nextMissingPrompt(s) {
   if (!(addr.line1 && addr.city && addr.zip)) {
     return 'Please say the full service address—street, city, and zip.';
   }
-  // Pricing prompt REMOVED per request.
   if (!s.preferred_date) return 'What day works for your visit? The earliest availability is tomorrow.';
   if (!s.preferred_time && !s.preferred_window) {
     return 'What time window works for you—morning, afternoon, or flexible all day?';
@@ -594,8 +595,8 @@ function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
 
 // Detect yes/no-style questions for fast handling
 function isYesNoQuestion(q = '') {
-  const t = (q || '').toLowerCase();
-  return /\b(is (?:that|this) (?:right|correct)|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead)\b/.test(t);
+  const t = (q || '').toLowerCase().replace(/[.!\s]+$/g,'').trim();
+  return t.endsWith('?') || /\b(is (?:that|this) (?:right|correct)|does that work|would you like|can we proceed|okay to proceed|is that ok|is that okay|sound good|look good|call[- ]ahead|is this correct|is that correct)\b/.test(t);
 }
 
 // (kept for internal use, not spoken)
@@ -631,8 +632,7 @@ function serverSideDoneCheck(slots) {
   return (
     !!s.full_name &&
     !!s.callback_number &&
-    !!addr.line1 && !!addr.city && !!addr.zip && // state auto-filled if missing
-    // pricing_disclosed no longer required
+    !!addr.line1 && !!addr.city && !!addr.zip &&
     dateOK &&
     (timeOK || winOK)
   );
@@ -653,7 +653,6 @@ function windowToTimes(dateISO, window, tz) {
 function timeToTimes(dateISO, timeHHMM, tz) {
   const d = (dateISO || '').slice(0, 10);
   const start = `${d}T${timeHHMM || '09:00'}:00`;
-  // default 60-minute slot
   const [hh, mm] = (timeHHMM || '09:00').split(':').map(Number);
   const endH = String((hh + 1) % 24).padStart(2, '0');
   const end = `${d}T${endH}:${String(mm).padStart(2,'0')}:00`;
@@ -754,11 +753,9 @@ function handlePhoneProgress(speech, slots) {
   const s = { ...(slots || {}) };
   if (s.callback_number) return { slots: s, reply: null, handled: false };
 
-  // Accept spoken numbers like "seven one two..."
   const heardDigits = normalizeDigitWords(speech || '').replace(/\D+/g, '');
   const existing = (s._phone_partial || '').replace(/\D+/g, '');
 
-  // If nothing number-like has been said yet, bail out.
   if (!heardDigits && !existing) {
     return { slots: s, reply: null, handled: false };
   }
@@ -777,7 +774,6 @@ function handlePhoneProgress(speech, slots) {
     };
   }
 
-  // Still incomplete—stash what we have and ask for the rest
   if (combined.length > 0) {
     s._phone_partial = combined;
     const remaining = Math.max(10 - combined.length, 1);
@@ -1002,7 +998,12 @@ export default async function handler(req, res) {
     mergedSlots = normalizeDateTimeInSlots(mergedSlots, DEFAULT_TZ);
 
     // ---- Continue / move on → next missing
-    if (!mergedSlots.confirmation_pending && !mergedSlots.address_confirm_pending && !mergedSlots.callback_confirm_pending && wantsToContinue(speech)) {
+    if (
+      !mergedSlots.confirmation_pending &&
+      !mergedSlots.address_confirm_pending &&
+      !mergedSlots.callback_confirm_pending &&
+      wantsToContinue(speech)
+    ) {
       const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
       return res.status(200).json({
         reply: E(prompt),
@@ -1175,7 +1176,6 @@ export default async function handler(req, res) {
           s.call_ahead === false ? 'Call-ahead: NO' : 'Call-ahead: YES',
         ].filter(Boolean).join('\n');
 
-        // Defensive normalization
         const sNorm = normalizeDateTimeInSlots(s, DEFAULT_TZ);
         const safeDateISO = isISODate(sNorm.preferred_date) ? sNorm.preferred_date : null;
         const safeTimeHHMM = isHHMM(sNorm.preferred_time) ? sNorm.preferred_time : null;
