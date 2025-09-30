@@ -156,12 +156,6 @@ function inferPreferredWindowFrom(text) {
   if (/\bflexible\b.*\ball day\b|\ball day\b.*\bflexible\b/i.test(t)) return 'flexible_all_day';
   return null;
 }
-function inferYesNoCallAhead(text) {
-  const t = (text || '').toLowerCase();
-  if (/\b(yes|yeah|yep|sure|please do|that works|ok|okay)\b/.test(t)) return true;
-  if (/\b(no|nope|nah|don’t|do not|no thanks|not necessary)\b/.test(t)) return false;
-  return null;
-}
 function getLastAssistantQuestion(history) {
   const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
   for (let i = assistantLines.length - 1; i >= 0; i--) {
@@ -579,19 +573,6 @@ function nextMissingPrompt(s) {
   }
   return null;
 }
-function sameQuestionRepeatGuard(lastQ, newQ, speech, mergedSlots) {
-  if (!lastQ || !newQ) return { newReply: null, updated: false };
-  if (lastQ.trim() !== newQ.trim()) return { newReply: null, updated: false };
-  const win = inferPreferredWindowFrom(speech);
-  if (win && !mergedSlots.preferred_window) {
-    mergedSlots.preferred_window = win;
-    return {
-      newReply: `Got it—we'll reserve the ${win} window. Which day works best for you?`,
-      updated: true
-    };
-  }
-  return { newReply: null, updated: false };
-}
 
 // Detect yes/no-style questions for fast handling
 function isYesNoQuestion(q = '') {
@@ -810,8 +791,8 @@ export default async function handler(req, res) {
     if (mergedSlots.confirmation_pending !== true) mergedSlots.confirmation_pending = false;
     if (!mergedSlots.summary_reads) mergedSlots.summary_reads = 0;
 
-    // --- EMERGENCY FAST-PATH ---
-    if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell|smoke)\b/i.test(speech || '')) {
+    // --- EMERGENCY FAST-PATH --- (deduped 'smoke')
+    if (/\b(smoke|sparks?|gas (smell|leak)|carbon monoxide|fire|danger|burning smell)\b/i.test(speech || '')) {
       return res.status(200).json({
         reply: E("If you suspect a safety issue, please hang up and call 911 now. I’ll also alert our dispatcher immediately. Are you safe to continue?"),
         slots: mergedSlots,
