@@ -23,38 +23,28 @@ function baseUrlFromReq(req) {
 // Ensure the brand is pronounced like the intro everywhere it’s spoken.
 function pronounceBrandForTTS(text = '') {
   if (!text) return text;
-  // Collapse variants (HVAC/H.V.A.C) to the spaced “H. V. A. C Joy” for TTS
   return text.replace(/\bH\.?\s*V\.?\s*A\.?\s*C\.?\s+Joy\b/gi, 'H. V. A. C Joy');
 }
 
-// Used by <Play> everywhere (intro included)
 function ttsUrlAbsolute(baseUrl, text, voice) {
   const spoken = pronounceBrandForTTS(text || '');
   const params = new URLSearchParams({ text: spoken });
-  if (voice) params.set('voice', voice); // /api/tts can also default
+  if (voice) params.set('voice', voice);
   return `${baseUrl}/api/tts?${params.toString()}`;
 }
 
-// Pretty formatter for confirmations/goodbyes — TZ-safe & preserves wall-clock time
 function formatPretty(dateISO, timeHHMM, tz = DEFAULT_TZ) {
   if (!dateISO) return '';
-
   const [y, m, d] = dateISO.split('-').map(Number);
-
-  // Anchor at noon UTC so the *date* renders correctly in the target TZ
   const anchor = new Date(Date.UTC(y, m - 1, d, 12, 0, 0));
-
   const weekday = new Intl.DateTimeFormat('en-US', { timeZone: tz, weekday: 'long' }).format(anchor);
   const monthDay = new Intl.DateTimeFormat('en-US', { timeZone: tz, month: 'long', day: 'numeric' }).format(anchor);
-
   let timePart = null;
   if (timeHHMM) {
     const [hh, mm] = timeHHMM.split(':').map(Number);
-    const h12 = ((hh % 12) || 12);
-    const ampm = hh < 12 ? 'AM' : 'PM';
+    const h12 = ((hh % 12) || 12); const ampm = hh < 12 ? 'AM' : 'PM';
     timePart = `${h12}:${String(mm).padStart(2, '0')} ${ampm}`;
   }
-
   return timePart ? `${weekday}, ${monthDay} at ${timePart}` : `${weekday}, ${monthDay}`;
 }
 
@@ -101,11 +91,25 @@ async function introAlreadyPlayed(supabase, callSid) {
   } catch (_) { return true; }
 }
 
-// ---- NEW: robust extractor for the last question even if more text follows
+// ---- robust extractor for the last question (even without "?")
 function extractLastQuestionLine(text = '') {
   if (!text) return null;
-  const m = text.match(/([^?]*\?)[^?]*$/);
-  return m ? m[1].trim() : null;
+  const trimmed = String(text).trim();
+  const m = trimmed.match(/([^?]*\?)[^?]*$/);
+  if (m) return m[1].trim();
+  const patterns = [
+    /(is|was)\s+(that|this)\s+(right|correct)\.?$/i,
+    /(does|do)\s+that\s+work\.?$/i,
+    /(would|will)\s+you\s+like\s+to\s+proceed\.?$/i,
+    /(can|may)\s+we\s+proceed\.?$/i,
+    /okay\s+to\s+proceed\.?$/i,
+    /sound\s+good\.?$/i,
+    /look\s+good\.?$/i,
+    /call[- ]ahead\??$/i,
+    /is\s+(this|that)\s+okay\.?$/i,
+  ];
+  for (const re of patterns) if (re.test(trimmed)) return trimmed;
+  return null;
 }
 
 async function getLastAssistantQuestion(supabase, callSid) {
@@ -133,7 +137,7 @@ function isUnclear(text = '') {
   const t = (text || '').trim().toLowerCase();
   if (!t) return true;
   // Short confirmations/denials are clear (don’t treat as noise)
-  if (/^(yes|no|ok|okay|yeah|yep|nope|correct|that'?s (right|correct))$/i.test(t)) return false;
+  if (/^(yes|ya|yeah|yep|no|ok|okay|correct|that'?s (right|correct))$/i.test(t)) return false;
   if (t.length <= 2) return true;
   if (/\b(play|he told|audio|uh|umm?|hmm?)\b/.test(t)) return true;
   return false;
@@ -149,31 +153,25 @@ function makeGoodbyeFromSlots(slots = {}) {
   const pretty = formatPretty(slots.preferred_date, slots.preferred_time || null, DEFAULT_TZ);
   const when = pretty ? ` on ${pretty}` : '';
   const nameBit = firstName ? `, ${firstName}` : '';
-  const callAheadBit = (slots.call_ahead === false)
-    ? ' We will arrive within your window without a call-ahead.'
-    : ' We will call ahead before arriving.';
-  // Updated closing per request
+  const callAheadBit = (slots.call_ahead === false) ? ' We will arrive within your window without a call-ahead.' : ' We will call ahead before arriving.';
   const confirmNote = ' A member of our team will contact you to confirm the appointment.';
   return `Thank you${nameBit}. You’re scheduled${when}.${callAheadBit}${confirmNote} Thank you for calling Smith Heating & Air. Good Bye.`;
 }
 
 function normalizeCallAheadInText(text = '', slots = {}) {
   if (slots.call_ahead === false) {
-    return text.replace(/(you'?ll|we will|we’ll).*call[- ]ahead.*?(?=\.|$)/gi,
-      'You are set in the selected arrival window');
+    return text.replace(/(you'?ll|we will|we’ll).*call[- ]ahead.*?(?=\.|$)/gi, 'You are set in the selected arrival window');
   }
   return text;
 }
 
 // ---------- Sympathy helpers ----------
 const PROBLEM_RE = /(no\s+(cool|cold|heat|air|airflow)|not\s+(cooling|cold|heating|working)|(not\s+(?:blow|blowing)\s+(?:cold|cool)|no\s+(?:cold|cool)\s+air)|won'?t\s+(turn\s*on|start|cool|heat|blow)|stopp?ed\s+(working|cooling|heating)|(ac|a\.?c\.?|unit|system|hvac).*(broke|broken|out|down|leak|leaking|smell|odor|noise|noisy|rattle|buzz|ice|iced|frozen)|(problem|issue|trouble)\s+(with|in|on)\s+(my\s+)?(ac|a\.?c\.?|unit|system|hvac)|\bvery\s+(hot|cold)\b|burning up|freezing)/i;
-
 function detectedProblem(text = '') {
   const t = (text || '').toLowerCase();
-  if (/\bno problem\b/.test(t)) return false; // avoid “no problem”
+  if (/\bno problem\b/.test(t)) return false;
   return PROBLEM_RE.test(t);
 }
-
 function maybeAddEmpathyOnFallback(userText, reply) {
   if (detectedProblem(userText) && !/sorry|apologiz/i.test(reply)) {
     return `I’m sorry to hear that. ${reply}`;
@@ -181,9 +179,9 @@ function maybeAddEmpathyOnFallback(userText, reply) {
   return reply;
 }
 
-// Common <Gather> attributes (added “no/nope/incorrect” and spoken digits help)
+// Common <Gather> attributes (added lots of “yes” variants)
 function gatherAttrs(actionUrl) {
-  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" hints="yes, yeah, yep, correct, that is correct, that’s correct, no, nope, not correct, incorrect, looks good, sounds good, proceed, continue, move on, next, skip, go ahead, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
+  return `input="speech" action="${actionUrl}" method="POST" language="en-US" speechTimeout="auto" hints="yes, yeah, ya, yup, correct, that is correct, that’s correct, no, nope, not correct, incorrect, looks good, sounds good, proceed, continue, move on, next, skip, go ahead, morning, afternoon, street, drive, road, avenue, boulevard, lane, court, way, walk, trail, circle, parkway, pkwy, place, terrace, point, loop, run, Dallas, Kennesaw, Georgia, GA, zip, zero one two three four five six seven eight nine, oh, o, A through Z" profanityFilter="false"`;
 }
 
 // ---------- Handler ----------
@@ -222,11 +220,7 @@ export default async function handler(req, res) {
 
       const welcome = 'Welcome to Smith Heating & Air. I am your digital assistant Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
       const welcomeUrl = ttsUrlAbsolute(baseUrl, welcome, SELECTED_VOICE);
-      const didntCatchUrl = ttsUrlAbsolute(
-        baseUrl,
-        'Sorry, I didn’t catch that. Please say the full service address—street, city, and zip.',
-        SELECTED_VOICE
-      );
+      const didntCatchUrl = ttsUrlAbsolute(baseUrl, 'Sorry, I didn’t catch that. Please say the full service address—street, city, and zip.', SELECTED_VOICE);
 
       const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
@@ -269,10 +263,7 @@ export default async function handler(req, res) {
         .limit(40);
 
       const lastAssistantWithSlots = (lastTurns || []).find(
-        t =>
-          t.role === 'assistant' &&
-          t?.meta?.slots &&
-          Object.keys(t.meta.slots || {}).length > 0
+        t => t.role === 'assistant' && t?.meta?.slots && Object.keys(t.meta.slots || {}).length > 0
       );
       if (lastAssistantWithSlots?.meta?.slots) lastSlots = lastAssistantWithSlots.meta.slots;
 
@@ -283,9 +274,7 @@ export default async function handler(req, res) {
         lastQuestion = String(lastAssistantWithQMeta.meta.last_question);
       } else {
         const qRow = (lastTurns || []).find(
-          t => t.role === 'assistant' &&
-               t?.meta?.type !== 'intro' &&
-               extractLastQuestionLine((t.text || '').trim())
+          t => t.role === 'assistant' && t?.meta?.type !== 'intro' && extractLastQuestionLine((t.text || '').trim())
         );
         if (qRow) lastQuestion = extractLastQuestionLine((qRow.text || '').trim());
       }
@@ -319,13 +308,11 @@ export default async function handler(req, res) {
       } else {
         const text = await resp?.text();
         console.error('Chat API error:', text);
-        // Re-ask the last question so we don't lose user context (fix)
         const reask = lastQuestion || "Sorry, I didn’t catch that. Could you please repeat that?";
         reply = maybeAddEmpathyOnFallback(speech, reask);
       }
     } catch (e) {
       console.error('Chat API error:', e);
-      // Re-ask the last question so we don't lose user context (fix)
       const reask = lastQuestion || "Sorry, I didn’t catch that. Could you please repeat that?";
       reply = maybeAddEmpathyOnFallback(speech, reask);
     }
@@ -341,10 +328,7 @@ export default async function handler(req, res) {
     await logTurn({ supabase, caller: from, callSid, text: reply, role: 'assistant', meta });
 
     if (done) {
-      const byeText = (goodbye && goodbye.trim())
-        ? goodbye
-        : makeGoodbyeFromSlots(slots);
-
+      const byeText = (goodbye && goodbye.trim()) ? goodbye : makeGoodbyeFromSlots(slots);
       const parts = [];
       parts.push('<?xml version="1.0" encoding="UTF-8"?>');
       parts.push('<Response>');
@@ -371,11 +355,7 @@ export default async function handler(req, res) {
     return sendXml(res, twiml);
   } catch (err) {
     console.error('Webhook error:', err);
-    const fallbackUrl = ttsUrlAbsolute(
-      baseUrl,
-      'Sorry, I ran into a problem. I will connect you to a live agent.',
-      SELECTED_VOICE
-    );
+    const fallbackUrl = ttsUrlAbsolute(baseUrl, 'Sorry, I ran into a problem. I will connect you to a live agent.', SELECTED_VOICE);
     const twiml = `<?xml version="1.0" encoding="UTF-8"?>
 <Response>
   <Play>${fallbackUrl}</Play>
