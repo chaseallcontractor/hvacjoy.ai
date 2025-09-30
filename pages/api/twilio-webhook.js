@@ -311,11 +311,15 @@ export default async function handler(req, res) {
       } else {
         const text = await resp?.text();
         console.error('Chat API error:', text);
-        reply = maybeAddEmpathyOnFallback(speech, "Thanks. I heard you. Give me just a moment.");
+        // Re-ask the last question so we don't lose user context (fix)
+        const reask = lastQuestion || "Sorry, I didn’t catch that. Could you please repeat that?";
+        reply = maybeAddEmpathyOnFallback(speech, reask);
       }
     } catch (e) {
       console.error('Chat API error:', e);
-      reply = maybeAddEmpathyOnFallback(speech, "Thanks. I heard you. Give me just a moment.");
+      // Re-ask the last question so we don't lose user context (fix)
+      const reask = lastQuestion || "Sorry, I didn’t catch that. Could you please repeat that?";
+      reply = maybeAddEmpathyOnFallback(speech, reask);
     }
 
     // respect call-ahead preference in any generated line

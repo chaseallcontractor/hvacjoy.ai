@@ -1047,6 +1047,27 @@ export default async function handler(req, res) {
       }
     }
 
+    // ===== NEW BLOCK: plain “yes” to an open-ended prompt → advance =====
+    if (
+      !mergedSlots.confirmation_pending &&
+      !mergedSlots.address_confirm_pending &&
+      !mergedSlots.callback_confirm_pending &&
+      isAffirmation(speech) &&
+      !isYesNoQuestion(lastQ)
+    ) {
+      const prompt = nextMissingPrompt(mergedSlots) || 'Great—thanks. What day works for your visit? The earliest is tomorrow.';
+      return res.status(200).json({
+        reply: E(prompt),
+        slots: mergedSlots,
+        done: false,
+        goodbye: null,
+        needs_confirmation: false,
+        model: 'gpt-4o-mini',
+        usage: null,
+      });
+    }
+    // ====================================================================
+
     // ---- Normal LLM step ---------------------------------------------------
     const steering =
       'Continue the call. Do not repeat the greeting.' +
