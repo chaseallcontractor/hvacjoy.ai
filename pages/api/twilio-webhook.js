@@ -101,6 +101,13 @@ async function introAlreadyPlayed(supabase, callSid) {
   } catch (_) { return true; }
 }
 
+// ---- NEW: robust extractor for the last question even if more text follows
+function extractLastQuestionLine(text = '') {
+  if (!text) return null;
+  const m = text.match(/([^?]*\?)[^?]*$/);
+  return m ? m[1].trim() : null;
+}
+
 async function getLastAssistantQuestion(supabase, callSid) {
   try {
     const { data } = await supabase
@@ -115,7 +122,8 @@ async function getLastAssistantQuestion(supabase, callSid) {
       if (row?.meta?.type === 'intro') continue;
       if (row?.meta?.last_question) return String(row.meta.last_question);
       const t = (row.text || '').trim();
-      if (t.endsWith('?')) return t;
+      const q = extractLastQuestionLine(t);
+      if (q) return q;
     }
   } catch (_) {}
   return null;
@@ -277,9 +285,9 @@ export default async function handler(req, res) {
         const qRow = (lastTurns || []).find(
           t => t.role === 'assistant' &&
                t?.meta?.type !== 'intro' &&
-               (t.text || '').trim().endsWith('?')
+               extractLastQuestionLine((t.text || '').trim())
         );
-        if (qRow) lastQuestion = (qRow.text || '').trim();
+        if (qRow) lastQuestion = extractLastQuestionLine((qRow.text || '').trim());
       }
     } catch (_) {}
 
@@ -327,7 +335,8 @@ export default async function handler(req, res) {
 
     const meta = { slots, done, goodbye };
     const trimmed = (reply || '').trim();
-    if (trimmed.endsWith('?')) meta.last_question = trimmed;
+    const lastQForMeta = extractLastQuestionLine(trimmed);
+    if (lastQForMeta) meta.last_question = lastQForMeta;
 
     await logTurn({ supabase, caller: from, callSid, text: reply, role: 'assistant', meta });
 

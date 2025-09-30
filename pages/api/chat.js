@@ -156,11 +156,20 @@ function inferPreferredWindowFrom(text) {
   if (/\bflexible\b.*\ball day\b|\ball day\b.*\bflexible\b/i.test(t)) return 'flexible_all_day';
   return null;
 }
+
+// NEW: robust extractor for the last question even if more text follows
+function extractLastQuestionLine(text = '') {
+  if (!text) return null;
+  const m = text.match(/([^?]*\?)[^?]*$/);
+  return m ? m[1].trim() : null;
+}
+
 function getLastAssistantQuestion(history) {
   const assistantLines = (history || []).filter(m => m.role === 'assistant').map(m => m.content);
   for (let i = assistantLines.length - 1; i >= 0; i--) {
     const line = (assistantLines[i] || '').trim();
-    if (line.endsWith('?')) return line;
+    const q = extractLastQuestionLine(line);
+    if (q) return q;
   }
   return null;
 }
@@ -527,7 +536,7 @@ function addEmpathy(speech, reply) {
 
 // quick yes/no helpers
 function isAffirmation(text='') {
-  const norm = (text || '').toLowerCase().trim().replace(/[!.?,;:]+$/g,'').replace(/\s+/g,' ');
+  const norm = (text || '').toLowerCase().trim().replace(/[!.?,;:]+$/g,'').replace(/\s+/g, ' ');
   return /\b(yes|yep|yeah|yah|yup|sure|ok|okay|correct|that'?s (right|correct)|looks good|sounds good|please continue|go ahead|proceed|continue|that works)\b/i.test(norm);
 }
 function isNegation(text='') {
