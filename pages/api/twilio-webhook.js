@@ -68,29 +68,6 @@ function withTimeout(ms) {
   return { signal: controller.signal, cancel: () => clearTimeout(id) };
 }
 
-// ---------- Intro replay guard ----------
-async function introAlreadyPlayed(supabase, callSid) {
-  if (!callSid) return true; // fail-safe
-  try {
-    const { data } = await supabase
-      .from('call_transcripts')
-      .select('role, meta, text, turn_index')
-      .eq('call_sid', callSid)
-      .order('turn_index', { ascending: false })
-      .limit(30);
-
-    let seenAssistant = false;
-    for (const row of (data || [])) {
-      if (row.role === 'assistant') {
-        seenAssistant = true;
-        if (row?.meta?.type === 'intro') return true;
-        if (/(^|\s)welcome to h\.?\s*v\.?\s*a\.?\s*c/i.test(row.text || '')) return true;
-      }
-    }
-    return seenAssistant;
-  } catch (_) { return true; }
-}
-
 // ---- robust extractor for the last question (even without "?")
 function extractLastQuestionLine(text = '') {
   if (!text) return null;
@@ -133,11 +110,31 @@ async function getLastAssistantQuestion(supabase, callSid) {
   return null;
 }
 
+// ---------- “unclear” logic (fixed to accept yes/no with punctuation) ----------
+function normalizeASR(s = '') {
+  return String(s || '')
+    .toLowerCase()
+    .replace(/[“”"‘’]/g, '')      // smart quotes
+    .replace(/[.!?,;:]/g, '')     // trailing punctuation
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+function isAffirmationLite(s = '') {
+  const t = normalizeASR(s);
+  return /\b(yes|yep|yeah|yah|ya|yup|sure|ok|okay|correct|right|affirmative|uh huh|uh-huh|that(?:'|’)s (?:right|correct))\b/i.test(t);
+}
+function isNegationLite(s = '') {
+  const t = normalizeASR(s);
+  return /\b(no|nope|nah|negative|not (?:right|correct)|incorrect|wrong)\b/i.test(t);
+}
+function isYesNoLike(s = '') {
+  return isAffirmationLite(s) || isNegationLite(s);
+}
 function isUnclear(text = '') {
-  const t = (text || '').trim().toLowerCase();
+  const t = normalizeASR(text);
   if (!t) return true;
-  // Short confirmations/denials are clear (don’t treat as noise)
-  if (/^(yes|ya|yeah|yep|no|ok|okay|correct|that'?s (right|correct))$/i.test(t)) return false;
+  // ✅ Treat any yes/no (with punctuation/noise stripped) as clear
+  if (isYesNoLike(t)) return false;
   if (t.length <= 2) return true;
   if (/\b(play|he told|audio|uh|umm?|hmm?)\b/.test(t)) return true;
   return false;
@@ -210,8 +207,8 @@ export default async function handler(req, res) {
   const supabase = getSupabaseAdmin();
   const introPlayed = await introAlreadyPlayed(supabase, callSid);
 
-  // First/noisy turn handling
-  if ((!speech || isUnclear(speech)) && !userSaysWeAreScheduling(speech)) {
+  // 🔧 First/noisy turn handling — do NOT intercept clear yes/no anymore
+  if ((!speech || (isUnclear(speech) && !isYesNoLike(speech))) && !userSaysWeAreScheduling(speech)) {
     if (!introPlayed) {
       const introDisplay =
         'Welcome to H.V.A.C Joy. To ensure the highest quality service, this call may be recorded and monitored. How can I help today?';
